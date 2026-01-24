@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpp_re_agent"
+version = "0.1.0"
+description = "AI-powered C++ Reverse Engineering Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "unimpossible", email = "3935212+unimpossible@users.noreply.github.com."}
+]
+dependencies = [
+    "streamlit",
+    "ghidrecomp",
+    "google-generativeai",
+    "openai",
+    "python-dotenv",
+    "chromadb",
+    "langchain",
+    "langchain-community",
+    "langchain-openai",
+    "langchain-google-genai",
+    "tree-sitter",
+    "tree-sitter-cpp"
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/cpp_re_agent"

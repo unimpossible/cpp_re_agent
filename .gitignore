@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Environment Variables
+.env
+
+# Local Configuration
+config.json
+
+# Project Output / Workspace
+workspace/
+
+# Vector Database (ChromaDB)
+chroma_db/
+
+# Binaries and Object Files
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+hello_world
+
+# IDEs
+.vscode/
+.idea/
