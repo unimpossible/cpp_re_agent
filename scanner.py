@@ -7,7 +7,7 @@ import tree_sitter_cpp
 # Data Model for Structured Output
 class CppType(BaseModel):
     name: str = Field(description="Name of the struct or class")
-    kind: str = Field(description="Either 'struct' or 'class'")
+    kind: str = Field(description="Either 'struct', 'class', 'function', or 'declaration'")
     body: str = Field(description="The full body of the struct/class definition including fields and methods")
     dependencies: List[str] = Field(description="List of other types this type depends on", default=[])
 
@@ -21,12 +21,28 @@ def extract_types_from_node(node, source_code: bytes) -> List[CppType]:
     
     # Traverse errors gracefully 
     # (Tree-sitter produces ERROR nodes but keeps the rest of the tree intact)
-    if node.type in ["struct_specifier", "class_specifier"]:
+    if node.type in ["struct_specifier", "class_specifier", "function_definition", "declaration"]:
         try:
             name_node = node.child_by_field_name("name")
+            # Handling name extraction for declarations which might be nested in declarators
+            if not name_node and node.type == "declaration":
+                 declarator = node.child_by_field_name("declarator")
+                 if declarator:
+                     if declarator.type == "function_declarator":
+                         name_node = declarator.child_by_field_name("declarator")
+                     else:
+                         name_node = declarator
+
             if name_node:
                 name = source_code[name_node.start_byte:name_node.end_byte].decode("utf-8")
-                kind = "struct" if "struct" in node.type else "class"
+                if "struct" in node.type:
+                    kind = "struct"
+                elif "class" in node.type:
+                    kind = "class"
+                elif "function" in node.type:
+                    kind = "function"
+                else:
+                    kind = "declaration"
                 body = source_code[node.start_byte:node.end_byte].decode("utf-8")
                 
                 # Basic dependency extraction (very naive: regex matching or deeper traversal)

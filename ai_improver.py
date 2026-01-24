@@ -31,6 +31,7 @@ def improve_function(code: str, provider="gemini", model_name="openai/gpt-oss-20
         "4. Do NOT change the functional behavior. "
         "5. Return ONLY the C++ code, no markdown fencing."
         "6. Create structs or classes where appropriate."
+        "7. If you arent sure what something does, do not rename it."
     )
 
     try:

@@ -80,8 +80,9 @@ def consolidate_types(provider="local") -> str:
         "1. Identify unique types.\n"
         "2. Merge partial definitions into the most complete version.\n"
         "3. Resolve naming conflicts (prefer more descriptive names).\n"
-        "4. Generate a single valid `project.h` file containing all these merged definitions.\n"
-        "5. Return ONLY the C++ code.\n\n"
+        "4. Identify any matching function prototypes or forward declarations and include them.\n"
+        "5. Generate a single valid `project.h` file containing all these merged definitions.\n"
+        "6. Return ONLY the C++ code.\n\n"
         f"Definitions:\n{all_definitions}"
     )
     
