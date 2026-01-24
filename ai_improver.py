@@ -1,26 +1,4 @@
-import os
-import google.generativeai as genai
-from openai import OpenAI
-from dotenv import load_dotenv
-
-load_dotenv()
-
-def get_client(provider="gemini"):
-    """
-    Factory function to get the appropriate AI client.
-    """
-    if provider == "gemini":
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            return None # Handle gracefully in UI
-        genai.configure(api_key=api_key)
-        return "gemini_client" # Placeholder, actual call differs slightly
-    elif provider == "local":
-        # Assumes local server running at standard OpenAI compatible endpoint
-        base_url = os.getenv("LOCAL_LLM_URL", "http://localhost:1234/v1")
-        api_key = os.getenv("LOCAL_LLM_KEY", "lm-studio") # Key often doesn't matter for local
-        return OpenAI(base_url=base_url, api_key=api_key)
-    return None
+from llm_factory import get_llm
 
 def should_improve(code: str) -> bool:
     """
@@ -39,6 +17,7 @@ def should_improve(code: str) -> bool:
 def improve_function(code: str, provider="gemini", model_name="openai/gpt-oss-20b") -> str:
     """
     Sends the code to the selected LLM provider for improvement.
+    Uses LangChain via llm_factory for consistency.
     """
     if not should_improve(code):
         return code # Return original if we skip
@@ -55,30 +34,19 @@ def improve_function(code: str, provider="gemini", model_name="openai/gpt-oss-20
     )
 
     try:
-        if provider == "gemini":
-            client = get_client("gemini")
-            if not client:
-                return "// Error: GEMINI_API_KEY not set."
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(f"{system_prompt}\n\nCode:\n{code}")
-            return response.text.strip().replace("```cpp", "").replace("```", "")
+        # Get standardized LangChain LLM
+        llm = get_llm(provider, model_name)
+        if not llm:
+            return "// Error: LLM client could not be initialized (check API keys/env)."
 
-        elif provider == "local":
-            client = get_client("local")
-            response = client.chat.completions.create(
-                model=model_name, # e.g. "qwen2.5-coder-7b"
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": code}
-                ],
-                temperature=0.2
-            )
-            print(f"DEBUG: LLM Response: {response}") # Debugging
-            
-            if not response or not hasattr(response, 'choices') or not response.choices:
-                 return f"// Error: Invalid response from Local LLM. raw response: {response}"
-                 
-            return response.choices[0].message.content.strip().replace("```cpp", "").replace("```", "")
+        # LangChain invoke
+        messages = [
+            ("system", system_prompt),
+            ("user", f"Code:\n{code}")
+        ]
+        
+        response = llm.invoke(messages)
+        return response.content.strip().replace("```cpp", "").replace("```", "")
             
     except Exception as e:
         return f"// Error during AI improvement: {str(e)}"

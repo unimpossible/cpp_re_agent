@@ -3,11 +3,7 @@ import chromadb
 import uuid
 from typing import List, Dict
 from scanner import CppType
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
-
-load_dotenv()
+from llm_factory import get_llm
 
 # Setup ChromaDB
 # Persistent local storage
@@ -58,20 +54,7 @@ def get_all_types() -> List[Dict]:
             })
     return all_types
 
-def get_llm(provider="local", model_name="openai/gpt-oss-20b"):
-    if provider == "gemini":
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key: return None
-        return ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key, temperature=0)
-    else:
-        # Local via OpenAI compatible endpoint
-        base_url = os.getenv("LOCAL_LLM_URL", "http://localhost:1234/v1")
-        return ChatOpenAI(
-            base_url=base_url, 
-            api_key="lm-studio", 
-            model=model_name,
-            temperature=0
-        )
+
 
 def consolidate_types(provider="local") -> str:
     """
