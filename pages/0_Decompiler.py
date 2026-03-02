@@ -114,10 +114,14 @@ with st.sidebar:
                 if not target_file.exists():
                     if ai_improver.should_improve(code):
                         try:
+                            # Get binary_path - using loop context or config
+                            bin_path_batch = config.get("binary_path", "hello_world")
                             improved_code = ai_improver.improve_function(
                                 code,
                                 provider=provider,
-                                model_name="gemini-1.5-flash" if provider == "gemini" else "openai/gpt-oss-20b"
+                                model_name="gemini-2.5-flash" if provider == "gemini" else "openai/gpt-oss-20b",
+                                binary_path=bin_path_batch,
+                                recursive=False
                             )
                             with open(target_file, "w", encoding="utf-8") as f:
                                 f.write(improved_code)
@@ -185,12 +189,22 @@ if selected_func:
         if improved_key not in st.session_state:
             if st.button("Improve with AI"):
                 if ai_improver.should_improve(selected_func):
-                    with st.spinner("AI is thinking..."):
+                    with st.status("AI is thinking...", expanded=True) as status:
+                        # Get binary_path relative to workspace or config
+                        bin_path = config.get("binary_path", "hello_world")
+                        
+                        def update_status(msg):
+                            status.write(msg)
+                        
                         improved_code = ai_improver.improve_function(
                             selected_func, 
                             provider=provider,
-                            model_name="gemini-1.5-flash" if provider == "gemini" else "openai/gpt-oss-20b"
+                            model_name="gemini-2.5-flash" if provider == "gemini" else "openai/gpt-oss-20b",
+                            binary_path=bin_path,
+                            recursive=True,
+                            status_callback=update_status
                         )
+                        status.update(label="Improvement Complete!", state="complete", expanded=False)
                         st.session_state[improved_key] = improved_code
                         
                         # Save to disk

@@ -55,25 +55,30 @@ with col1:
             status = st.empty()
             
             # Clear old DB before full scan (optional, but good for cleanliness)
-            # knowledge_graph.clear_db() 
+            knowledge_graph.clear_db() 
             
-            count = 0
+            count_types = 0
+            count_funcs = 0
+            
             for i, fpath in enumerate(files):
                 status.text(f"Scanning {fpath.name}...")
                 with open(fpath, "r") as f:
                     code = f.read()
                 
                 # Extract
-                types = scanner.scan_code(code, provider=provider)
+                items = scanner.scan_code(code)
                 
-                # Store
-                if types:
-                    knowledge_graph.add_types(types, fpath.name)
-                    count += len(types)
+                # Store (The new add_scan_results handles splitting)
+                if items:
+                    knowledge_graph.add_scan_results(items, fpath.name)
+                    
+                    # Just for stats
+                    count_types += len([t for t in items if t.kind != "function"])
+                    count_funcs += len([t for t in items if t.kind == "function"])
                 
                 progress_bar.progress((i + 1) / len(files))
                 
-            status.success(f"Scan Complete. Found {count} type definitions.")
+            status.success(f"Scan Complete. Indexed {count_types} types and {count_funcs} functions.")
             
     # Show current DB stats
     types = knowledge_graph.get_all_types()

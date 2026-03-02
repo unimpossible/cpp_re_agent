@@ -16,6 +16,18 @@ def get_parser():
     parser = Parser(CPP_LANGUAGE)
     return parser
 
+def extract_calls(node, source_code: bytes) -> List[str]:
+    calls = []
+    if node.type == "call_expression":
+        func_node = node.child_by_field_name("function")
+        if func_node:
+            name = source_code[func_node.start_byte:func_node.end_byte].decode("utf-8")
+            calls.append(name)
+    
+    for child in node.children:
+        calls.extend(extract_calls(child, source_code))
+    return calls
+
 def extract_types_from_node(node, source_code: bytes) -> List[CppType]:
     types = []
     
@@ -32,24 +44,46 @@ def extract_types_from_node(node, source_code: bytes) -> List[CppType]:
                          name_node = declarator.child_by_field_name("declarator")
                      else:
                          name_node = declarator
+            
+            # For function definitions, simple name extraction might fail if it's a pointer/ref/qualified
+            # naive fallback for function_definition: find the 'function_declarator' -> 'identifier'
+            if not name_node and node.type == "function_definition":
+                declarator = node.child_by_field_name("declarator")
+                if declarator:
+                    # Often nested: function_declarator -> identifier
+                    while declarator and declarator.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
+                        child = declarator.child_by_field_name("declarator")
+                        if not child: 
+                            # If no nested declarator, check for identifier directly in children
+                            for c in declarator.children:
+                                if c.type in ["identifier", "field_identifier", "qualified_identifier", "destructor_name"]:
+                                    name_node = c
+                                    break
+                            break
+                        declarator = child
+                    if not name_node:
+                        name_node = declarator
 
             if name_node:
                 name = source_code[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                calls = []
+
                 if "struct" in node.type:
                     kind = "struct"
                 elif "class" in node.type:
                     kind = "class"
                 elif "function" in node.type:
                     kind = "function"
+                    # NEW: Extract calls
+                    calls = list(set(extract_calls(node, source_code)))
                 else:
                     kind = "declaration"
+                
                 body = source_code[node.start_byte:node.end_byte].decode("utf-8")
                 
-                # Basic dependency extraction (very naive: regex matching or deeper traversal)
-                # For now, we leave dependencies empty or could perform a secondary scan
-                types.append(CppType(name=name, kind=kind, body=body))
+                types.append(CppType(name=name, kind=kind, body=body, dependencies=calls))
         except Exception as e:
-            print(f"Error parsing node: {e}")
+            print(f"Error parsing node {node.type}: {e}")
 
     for child in node.children:
         types.extend(extract_types_from_node(child, source_code))
