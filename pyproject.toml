@@ -23,9 +23,19 @@ dependencies = [
     "langchain-community",
     "langchain-openai",
     "langchain-google-genai",
+    "langfuse",
     "tree-sitter",
     "tree-sitter-cpp"
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.urls]
 Homepage = "https://github.com/unimpossible/cpp_re_agent"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

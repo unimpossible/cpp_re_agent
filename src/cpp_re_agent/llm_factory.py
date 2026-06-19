@@ -36,22 +36,33 @@ def get_llm(provider="local", model_name="openai/gpt-oss-20b"):
     Returns a LangChain LLM instance for the specified provider.
     """
     ai = None
+    # Bound every request so a hung/queued call fails fast instead of stalling a
+    # whole batch run indefinitely. Generous (slow reasoning models can take a
+    # couple of minutes) but finite, with a couple of retries for transient drops.
+    request_timeout = float(os.getenv("LLM_TIMEOUT", "300"))
+
     if provider == "gemini":
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key: return None
-        ai = ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key, temperature=0)
-    
+        ai = ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key,
+                                    temperature=0, timeout=request_timeout, max_retries=2)
+
     else: # Default to local / openai compatible
         # Local via OpenAI compatible endpoint
         base_url = os.getenv("LOCAL_LLM_URL", "http://localhost:1234/v1")
         # For local servers, key often doesn't matter, but we pass something
         ai = ChatOpenAI(
-            base_url=base_url, 
-            api_key=os.getenv("LOCAL_LLM_KEY", "lm-studio"), 
+            base_url=base_url,
+            api_key=os.getenv("LOCAL_LLM_KEY", "lm-studio"),
             model=model_name,
-            temperature=0.2
+            temperature=0.2,
+            timeout=request_timeout,
+            max_retries=2,
         )
 
-    # Use .with_config to attach the callback handler to the Runnable
-    # This returns a RunnableBinding that always applies the config
+    # Attach the Langfuse callback unless disabled. Set DISABLE_LANGFUSE=1 for
+    # long batch/experiment runs: its trace exporter can time out against an
+    # unreachable server and stall or crash the process.
+    if os.getenv("DISABLE_LANGFUSE", "").lower() in ("1", "true", "yes"):
+        return ai
     return ai.with_config(callbacks=[CallbackHandler()])

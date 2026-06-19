@@ -1,14 +1,10 @@
 import streamlit as st
 import os
-import sys
 from pathlib import Path
 
-# Add parent dir to sys.path to import modules
-sys.path.append(os.path.join(os.getcwd()))
-
-import scanner
-import knowledge_graph
-import decompiler
+from cpp_re_agent import scanner
+from cpp_re_agent import knowledge_graph
+from cpp_re_agent import decompiler
 
 st.set_page_config(layout="wide", page_title="Header Synthesis")
 
@@ -31,11 +27,14 @@ def load_config():
             pass
     return {"provider": "local", "binary_path": "hello_world"}
 
+DEFAULT_MODELS = {"gemini": "gemini-2.5-flash", "local": "openai/gpt-oss-20b"}
+
 config = load_config()
 provider = config.get("provider", "local")
+model_name = config.get("model_name", "").strip() or DEFAULT_MODELS.get(provider, "openai/gpt-oss-20b")
 binary_path = config.get("binary_path", "hello_world")
 
-st.info(f"Target: {binary_path} | Provider: {provider}")
+st.info(f"Target: {binary_path} | Provider: {provider} | Model: {model_name}")
 
 col1, col2 = st.columns(2)
 
@@ -91,7 +90,7 @@ with col2:
     
     if st.button("Consolidate & Generate project.h"):
         with st.spinner("Merging types..."):
-            header_content = knowledge_graph.consolidate_types(provider=provider)
+            header_content = knowledge_graph.consolidate_types(provider=provider, model_name=model_name)
             st.session_state["header_content"] = header_content
             
     if "header_content" in st.session_state:

@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Packaging
+*.egg-info/
+build/
+dist/
+
 # Virtual Environments
 .venv/
 venv/
@@ -16,6 +21,9 @@ config.json
 
 # Project Output / Workspace
 workspace/
+
+# Experiment runs (local artifacts: compile/decompile cache, results, leaderboards)
+experiments/
 
 # Vector Database (ChromaDB)
 chroma_db/

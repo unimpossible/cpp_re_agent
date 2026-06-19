@@ -3,9 +3,9 @@ import os
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import decompiler
-import ai_improver
-from llm_factory import get_llm
+from cpp_re_agent import decompiler
+from cpp_re_agent import ai_improver
+from cpp_re_agent.llm_factory import get_llm
 
 # --- Fixtures ---
 
@@ -95,27 +95,90 @@ def test_should_improve_filtering():
     long_code = "\n".join([f"line {i};" for i in range(15)])
     assert ai_improver.should_improve(long_code) is True
 
+
+def test_should_improve_skips_thunk_by_name():
+    """Functions Ghidra names thunk_* are delegating wrappers, not worth a call."""
+    code = (
+        "void thunk_FUN_00401000(int param_1)\n"
+        "{\n"
+        "  FUN_00401000(param_1);\n"
+        "  return;\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="thunk_FUN_00401000") is False
+
+
+def test_should_improve_skips_named_and_clean():
+    """A real-named function with no decompiler artifacts has little to recover."""
+    code = (
+        "int calculate_checksum(int length, char *data)\n"
+        "{\n"
+        "    int total = 0;\n"
+        "    for (int idx = 0; idx < length; idx = idx + 1)\n"
+        "        total = total + data[idx];\n"
+        "    return total;\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="calculate_checksum") is False
+
+
+def test_should_improve_keeps_artifact_heavy_function():
+    """A FUN_-named, artifact-laden function is exactly what we want to improve."""
+    code = (
+        "undefined4 FUN_00401000(int param_1)\n"
+        "{\n"
+        "    int iVar1;\n"
+        "    undefined4 uVar2;\n"
+        "    iVar1 = *(int *)(param_1 + 0x10);\n"
+        "    uVar2 = FUN_00402000(iVar1);\n"
+        "    return uVar2;\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="FUN_00401000") is True
+
+
+def test_score_prefers_artifact_heavy_code():
+    """score_function ranks an artifact/branch-heavy function above a clean one."""
+    clean = (
+        "int add(int a, int b)\n"
+        "{\n"
+        "    return a + b;\n"
+        "}\n"
+    )
+    gnarly = (
+        "undefined4 FUN_00401000(int param_1)\n"
+        "{\n"
+        "    int iVar1;\n"
+        "    undefined4 uVar2;\n"
+        "    if (param_1 == 0) { uVar2 = 0; }\n"
+        "    else { iVar1 = *(int *)(param_1 + 0x10); uVar2 = FUN_00402000(iVar1); }\n"
+        "    return uVar2;\n"
+        "}\n"
+    )
+    assert ai_improver.score_function(gnarly) > ai_improver.score_function(clean)
+
 def test_improve_function_calls_llm(mock_llm_response):
     """Test that improve_function invokes the LLM correctly."""
     code = "\n".join([f"iVar{i} = 0;" for i in range(20)]) # 20 lines
     
-    # Mock get_llm to return a mock object
-    with patch("ai_improver.get_llm") as mock_get_llm:
+    # Mock get_llm to return a mock object. improve_function streams the
+    # response (llm.stream), so the mock must yield chunks with .content.
+    with patch("cpp_re_agent.ai_improver.get_llm") as mock_get_llm:
         mock_chain = MagicMock()
-        mock_chain.invoke.return_value = mock_llm_response
+        mock_chain.stream.return_value = iter([mock_llm_response])
         mock_get_llm.return_value = mock_chain
-        
+
         result = ai_improver.improve_function(code, provider="local")
-        
+
         # Verify result content
         assert "struct User" in result
-        
+
         # Verify factory called
         mock_get_llm.assert_called_once()
-        
-        # Verify invoke called with prompt
-        mock_chain.invoke.assert_called_once()
-        args, _ = mock_chain.invoke.call_args
+
+        # Verify the model was streamed with the right prompt
+        mock_chain.stream.assert_called_once()
+        args, _ = mock_chain.stream.call_args
         messages = args[0]
         assert "expert C++ Reverse Engineer" in messages[0][1] # System prompt
         assert code in messages[1][1] # User prompt

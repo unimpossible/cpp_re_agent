@@ -1,16 +1,14 @@
 import streamlit as st
 import os
-import sys
 import time
 import json
 import pandas as pd
 from pathlib import Path
 
-# Add parent dir to sys.path to import modules
-sys.path.append(os.path.join(os.getcwd()))
-
-import decompiler
-import ai_improver
+from cpp_re_agent import decompiler
+from cpp_re_agent import ai_improver
+from cpp_re_agent import callgraph
+from cpp_re_agent import symbol_map
 
 # Constants
 WORKSPACE_DIR = os.path.join(os.getcwd(), "workspace")
@@ -25,10 +23,17 @@ def load_config():
             pass
     return {"provider": "local", "binary_path": "hello_world"}
 
+# Default model per provider, used when no custom model name is configured.
+DEFAULT_MODELS = {"gemini": "gemini-2.5-flash", "local": "openai/gpt-oss-20b"}
+
+def default_model_for(provider):
+    return DEFAULT_MODELS.get(provider, "openai/gpt-oss-20b")
+
 def save_config():
     config = {
         "provider": st.session_state.provider_input,
-        "binary_path": st.session_state.binary_input
+        "binary_path": st.session_state.binary_input,
+        "model_name": st.session_state.get("model_input", "").strip()
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f)
@@ -63,8 +68,22 @@ with st.sidebar:
         if api_key:
             os.environ["GEMINI_API_KEY"] = api_key
     elif provider == "local":
-        st.info("Using Local LLM at http://localhost:1234/v1 (Default)")
-    
+        default_url = "http://localhost:1234/v1"
+        local_url = os.getenv("LOCAL_LLM_URL", default_url)
+        suffix = " (Default)" if local_url == default_url else ""
+        st.info(f"Using Local LLM at {local_url}{suffix}")
+
+    # Model name: defaults per provider, but the user can override (e.g. to
+    # match whatever a custom OpenAI-compatible endpoint serves).
+    saved_model = config.get("model_name", "")
+    model_name = st.text_input(
+        "Model Name",
+        value=saved_model or default_model_for(provider),
+        key="model_input",
+        on_change=save_config,
+        help="Model identifier sent to the provider. Defaults per provider; override for custom endpoints.",
+    ).strip() or default_model_for(provider)
+
     st.divider()
     
     st.header("Target Binary")
@@ -101,35 +120,49 @@ with st.sidebar:
         if st.button(f"Batch Improve All ({len(functions)} functions)"):
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            # Convert to list for iteration
-            func_items = list(functions.items())
-            
-            for i, (name, code) in enumerate(func_items):
-                status_text.text(f"Processing {i+1}/{len(func_items)}: {name}")
-                
+
+            # Process functions leaves-first so callers see improved callee
+            # signatures (carried in the shared symbol map) as context.
+            workspace_dir = improved_dir.parent
+            graph = callgraph.build_callgraph(functions)
+            # Score each function once; use it only to break ties in the
+            # leaves-first order so high-value functions are improved earlier.
+            scores = {n: ai_improver.score_function(c) for n, c in functions.items()}
+            order = callgraph.topological_order(graph, priority=scores.get)
+            valid_names = set(functions.keys())
+            symbols = symbol_map.load_symbols(workspace_dir)
+            bin_path_batch = config.get("binary_path", "hello_world")
+
+            for i, name in enumerate(order):
+                code = functions[name]
+                status_text.text(f"Processing {i+1}/{len(order)}: {name}")
+
                 target_file = improved_dir / f"{name}.cpp"
-                
-                # Skip if already exists to save time/cost
-                if not target_file.exists():
-                    if ai_improver.should_improve(code):
-                        try:
-                            # Get binary_path - using loop context or config
-                            bin_path_batch = config.get("binary_path", "hello_world")
-                            improved_code = ai_improver.improve_function(
-                                code,
-                                provider=provider,
-                                model_name="gemini-2.5-flash" if provider == "gemini" else "openai/gpt-oss-20b",
-                                binary_path=bin_path_batch,
-                                recursive=False
-                            )
-                            with open(target_file, "w", encoding="utf-8") as f:
-                                f.write(improved_code)
-                        except Exception as e:
-                            print(f"Error improving {name}: {e}")
-                
-                progress_bar.progress((i + 1) / len(func_items))
-            
+
+                # Skip if already exists, but still record its signature so
+                # callers later in the order can use it as context.
+                if target_file.exists():
+                    if name not in symbols:
+                        symbol_map.record_improvement(symbols, name, target_file.read_text(encoding="utf-8"))
+                elif ai_improver.should_improve(code, name=name):
+                    try:
+                        improved_code = ai_improver.improve_function(
+                            code,
+                            provider=provider,
+                            model_name=model_name,
+                            binary_path=bin_path_batch,
+                            recursive=False,
+                            symbols=symbols,
+                            valid_names=valid_names,
+                        )
+                        target_file.write_text(improved_code, encoding="utf-8")
+                        symbol_map.record_improvement(symbols, name, improved_code)
+                    except Exception as e:
+                        print(f"Error improving {name}: {e}")
+
+                progress_bar.progress((i + 1) / len(order))
+
+            symbol_map.save_symbols(workspace_dir, symbols)
             status_text.success("Batch Processing Complete!")
             time.sleep(2)
             status_text.empty()
@@ -192,18 +225,28 @@ if selected_func:
                     with st.status("AI is thinking...", expanded=True) as status:
                         # Get binary_path relative to workspace or config
                         bin_path = config.get("binary_path", "hello_world")
-                        
+
+                        # Live preview of the streaming model output.
+                        stream_box = st.empty()
+
                         def update_status(msg):
                             status.write(msg)
-                        
+
+                        def on_stream(text):
+                            # Show a tail of the running output so the box
+                            # doesn't grow unbounded while streaming.
+                            stream_box.code(text[-2000:], language="cpp")
+
                         improved_code = ai_improver.improve_function(
-                            selected_func, 
+                            selected_func,
                             provider=provider,
-                            model_name="gemini-2.5-flash" if provider == "gemini" else "openai/gpt-oss-20b",
+                            model_name=model_name,
                             binary_path=bin_path,
                             recursive=True,
-                            status_callback=update_status
+                            status_callback=update_status,
+                            stream_callback=on_stream,
                         )
+                        stream_box.empty()
                         status.update(label="Improvement Complete!", state="complete", expanded=False)
                         st.session_state[improved_key] = improved_code
                         

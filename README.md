@@ -22,9 +22,9 @@ This tool utilizes Ghidra and Generative AI to assist in reverse engineering C++
 ## Installation
 
 1.  Clone the repository.
-2.  Install python dependencies:
+2.  Install the package (editable, with dev/test extras):
     ```bash
-    pip install -r requirements.txt
+    pip install -e ".[dev]"
     ```
 3.  Set up environment variables in a `.env` file (optional, can also be set in UI):
     ```
@@ -38,7 +38,7 @@ This tool utilizes Ghidra and Generative AI to assist in reverse engineering C++
 Run the Streamlit application:
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 ### Workflow
@@ -49,9 +49,13 @@ streamlit run app.py
 
 ## Project Structure
 
-*   `app.py`: Main Streamlit application entry point.
-*   `decompiler.py`: Wrapper for the `ghidrecomp` tool.
-*   `ai_improver.py`: Handles interactions with AI providers.
-*   `scanner.py`: Uses Tree-sitter to parse C++ struct/class definitions.
-*   `knowledge_graph.py`: Manages vector storage (ChromaDB) and type merging logic.
+*   `streamlit_app.py`: Main Streamlit application entry point.
+*   `pages/`: Streamlit multipage UI (Decompiler, Header Synthesis, Contextual Improver).
+*   `src/cpp_re_agent/`: The importable `cpp_re_agent` package.
+    *   `decompiler.py`: Wrapper for the `ghidrecomp` tool.
+    *   `ai_improver.py`: Handles interactions with AI providers.
+    *   `scanner.py`: Uses Tree-sitter to parse C++ struct/class definitions.
+    *   `knowledge_graph.py`: Manages vector storage (ChromaDB) and type merging logic.
+*   `tests/`: Pytest test suite.
+*   `examples/`: Sample binaries/source for experimentation.
 *   `workspace/`: Directory where outputs (raw decompilation, improved code, headers) are stored.

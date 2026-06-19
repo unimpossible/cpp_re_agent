@@ -90,6 +90,66 @@ def extract_types_from_node(node, source_code: bytes) -> List[CppType]:
         
     return types
 
+def is_valid_cpp(code: str) -> bool:
+    """
+    Returns True if `code` parses as C++ without tree-sitter ERROR nodes.
+
+    Used as a cheap validation gate on LLM output: it won't catch semantic
+    bugs, but it reliably rejects truncated functions, unbalanced braces, and
+    prose that leaked out of a code fence.
+    """
+    if not code or not code.strip():
+        return False
+
+    parser = get_parser()
+    root = parser.parse(code.encode("utf-8")).root_node
+
+    has_error = getattr(root, "has_error", None)
+    if callable(has_error):
+        has_error = has_error()
+    return not bool(has_error)
+
+
+# Node types that introduce a branch, i.e. add to cyclomatic complexity.
+# `&&`/`||` are the anonymous operator tokens inside a binary_expression and
+# show up as their own children when walking node.children.
+_BRANCH_NODES = {
+    "if_statement", "for_statement", "while_statement", "do_statement",
+    "case_statement", "conditional_expression", "&&", "||",
+}
+
+
+def complexity_metrics(code: str) -> dict:
+    """
+    Cheap structural metrics from the tree-sitter AST. Used to estimate how
+    much an LLM improvement pass is worth (see `ai_improver.score_function`).
+
+    Returns a dict with:
+      cyclomatic: 1 + number of branch points (if/for/while/case/&&/||).
+      calls:      number of call expressions.
+      max_depth:  maximum AST nesting depth (proxy for control-flow nesting).
+    """
+    parser = get_parser()
+    root = parser.parse(code.encode("utf-8")).root_node
+
+    metrics = {"cyclomatic": 1, "calls": 0, "max_depth": 0}
+
+    # Iterative walk to avoid Python recursion limits on deep decompiled trees.
+    stack = [(root, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if node.type in _BRANCH_NODES:
+            metrics["cyclomatic"] += 1
+        elif node.type == "call_expression":
+            metrics["calls"] += 1
+        if depth > metrics["max_depth"]:
+            metrics["max_depth"] = depth
+        for child in node.children:
+            stack.append((child, depth + 1))
+
+    return metrics
+
+
 def scan_code(code: str, provider="ignored") -> List[CppType]:
     """
     Extracts struct/class definitions from C++ code using Tree-Sitter.

@@ -1,15 +1,11 @@
 import streamlit as st
 import os
-import sys
 from pathlib import Path
 
-# Add parent dir to sys.path to import modules
-sys.path.append(os.path.join(os.getcwd()))
-
-import decompiler
-import contextual_improver
-import knowledge_graph
-from scanner import scan_code
+from cpp_re_agent import decompiler
+from cpp_re_agent import contextual_improver
+from cpp_re_agent import knowledge_graph
+from cpp_re_agent.scanner import scan_code
 
 st.set_page_config(layout="wide", page_title="Contextual Improver")
 
@@ -27,8 +23,11 @@ def load_config():
             pass
     return {"provider": "local", "binary_path": "hello_world"}
 
+DEFAULT_MODELS = {"gemini": "gemini-2.5-flash", "local": "openai/gpt-oss-20b"}
+
 config = load_config()
 provider = config.get("provider", "local")
+model_name = config.get("model_name", "").strip() or DEFAULT_MODELS.get(provider, "openai/gpt-oss-20b")
 binary_path = config.get("binary_path", "hello_world")
 binary_name = Path(binary_path).name
 workspace_dir = os.path.join(os.getcwd(), "workspace")
@@ -109,7 +108,7 @@ if selected_func_name:
                     current_code, 
                     header_content, 
                     provider=provider,
-                    model_name="openai/gpt-oss-20b" if provider=="local" else "gemini-1.5-flash"
+                    model_name=model_name
                 )
                 st.session_state[f"ctx_{selected_func_name}"] = new_code
         
