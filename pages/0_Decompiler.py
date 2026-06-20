@@ -9,6 +9,7 @@ from cpp_re_agent import decompiler
 from cpp_re_agent import ai_improver
 from cpp_re_agent import callgraph
 from cpp_re_agent import symbol_map
+from cpp_re_agent import pipeline
 
 # Constants
 WORKSPACE_DIR = os.path.join(os.getcwd(), "workspace")
@@ -116,53 +117,21 @@ with st.sidebar:
         improved_dir = Path(output_dir).parent / "improved"
         os.makedirs(improved_dir, exist_ok=True)
         
-        # Batch Processing
+        # Batch Processing — delegate the leaves-first, signature-map-propagated
+        # loop to the shared pipeline so the CLI and this page stay in lockstep.
         if st.button(f"Batch Improve All ({len(functions)} functions)"):
             progress_bar = st.progress(0)
             status_text = st.empty()
-
-            # Process functions leaves-first so callers see improved callee
-            # signatures (carried in the shared symbol map) as context.
             workspace_dir = improved_dir.parent
-            graph = callgraph.build_callgraph(functions)
-            # Score each function once; use it only to break ties in the
-            # leaves-first order so high-value functions are improved earlier.
-            scores = {n: ai_improver.score_function(c) for n, c in functions.items()}
-            order = callgraph.topological_order(graph, priority=scores.get)
-            valid_names = set(functions.keys())
-            symbols = symbol_map.load_symbols(workspace_dir)
             bin_path_batch = config.get("binary_path", "hello_world")
 
-            for i, name in enumerate(order):
-                code = functions[name]
-                status_text.text(f"Processing {i+1}/{len(order)}: {name}")
+            pipeline.batch_improve(
+                functions, workspace_dir, binary_path=bin_path_batch,
+                provider=provider, model_name=model_name,
+                status=lambda m: status_text.text(m),
+                on_progress=progress_bar.progress,
+            )
 
-                target_file = improved_dir / f"{name}.cpp"
-
-                # Skip if already exists, but still record its signature so
-                # callers later in the order can use it as context.
-                if target_file.exists():
-                    if name not in symbols:
-                        symbol_map.record_improvement(symbols, name, target_file.read_text(encoding="utf-8"))
-                elif ai_improver.should_improve(code, name=name):
-                    try:
-                        improved_code = ai_improver.improve_function(
-                            code,
-                            provider=provider,
-                            model_name=model_name,
-                            binary_path=bin_path_batch,
-                            recursive=False,
-                            symbols=symbols,
-                            valid_names=valid_names,
-                        )
-                        target_file.write_text(improved_code, encoding="utf-8")
-                        symbol_map.record_improvement(symbols, name, improved_code)
-                    except Exception as e:
-                        print(f"Error improving {name}: {e}")
-
-                progress_bar.progress((i + 1) / len(order))
-
-            symbol_map.save_symbols(workspace_dir, symbols)
             status_text.success("Batch Processing Complete!")
             time.sleep(2)
             status_text.empty()

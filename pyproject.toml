@@ -31,6 +31,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[project.scripts]
+cpp-re = "cpp_re_agent.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/unimpossible/cpp_re_agent"
 
