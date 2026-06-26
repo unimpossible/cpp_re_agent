@@ -1,0 +1,88 @@
+# Corpus manifest. Each entry describes one original C++ program that the
+# round-trip compiles, decompiles, and tries to recover. `path` is relative to
+# the repo root. `stdin_cases` are reserved for the later execution-based
+# semantic metric (P4) and unused by the static-proxy harness.
+#
+# Tiers: 0 free functions | 1 structs+arrays | 2 classes/methods | 3 STL.
+programs:
+  - id: tier0_numbers
+    tier: 0
+    path: eval/corpus/tier0_numbers.cpp
+    description: gcd / primality / collatz over plain ints.
+    stdin_cases: ["27\n", "48\n"]
+
+  - id: tier1_stats
+    tier: 1
+    path: eval/corpus/tier1_stats.cpp
+    description: mean and argmax over an array of a plain struct.
+    stdin_cases: [""]
+
+  - id: tier0_bitops
+    tier: 0
+    path: eval/corpus/tier0_bitops.cpp
+    description: popcount / reverse_bits / is_power_of_two bit-twiddling.
+    stdin_cases: ["183\n", "256\n"]
+
+  - id: tier1_inventory
+    tier: 1
+    path: eval/corpus/tier1_inventory.cpp
+    description: total value / low-stock count / find-by-id over an Item array.
+    stdin_cases: [""]
+
+  - id: tier1_geometry
+    tier: 1
+    path: eval/corpus/tier1_geometry.cpp
+    description: point distance and polygon perimeter.
+    stdin_cases: [""]
+
+  - id: tier1_textproc
+    tier: 1
+    path: eval/corpus/tier1_textproc.cpp
+    description: count vowels and words in a C string.
+    stdin_cases: [""]
+
+  - id: tier1_running
+    tier: 1
+    path: eval/corpus/tier1_running.cpp
+    description: int-array reductions — sum, Kadane max-subarray, longest run.
+    stdin_cases: [""]
+
+  - id: tier1_fraction
+    tier: 1
+    path: eval/corpus/tier1_fraction.cpp
+    description: Fraction struct; reduce/add/less_than sharing a gcd callee.
+    stdin_cases: [""]
+
+  - id: tier2_bank
+    tier: 2
+    path: eval/corpus/tier2_bank.cpp
+    description: Account class with deposit/withdraw/balance and guards.
+    stdin_cases: [""]
+
+  - id: tier2_matrix
+    tier: 2
+    path: eval/corpus/tier2_matrix.cpp
+    description: Matrix2x2 struct with determinant and multiply methods.
+    stdin_cases: [""]
+
+  - id: tier3_store
+    tier: 3
+    path: eval/corpus/tier3_store.cpp
+    description: point-of-sale model — six structs (Money/Product/Customer/
+      OrderLine/Order/Catalog) and a multi-level call graph (order_total ->
+      order_subtotal -> line_subtotal -> find_product). Bigger project.h; each
+      function references only a subset of types (context-retrieval target).
+    stdin_cases: [""]
+
+  # Seeded from the repo's existing examples.
+  - id: hello_world
+    tier: 2
+    path: examples/hello_world.cpp
+    description: User class with a method computing a "magic number".
+    stdin_cases: [""]
+
+  - id: sample_app
+    tier: 2
+    path: examples/sample_app.cpp
+    description: User class + vector usage, built -O2 for gnarlier decompilation.
+    stdin_cases: [""]

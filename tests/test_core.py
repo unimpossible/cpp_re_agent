@@ -137,6 +137,94 @@ def test_should_improve_keeps_artifact_heavy_function():
     assert ai_improver.should_improve(code, name="FUN_00401000") is True
 
 
+def test_should_improve_skips_std_namespace():
+    """Standard-library code (parsed std:: namespace) is not the user's code."""
+    code = (
+        "/* std::_Vector_base<int, std::allocator<int> >::_M_allocate(unsigned long) */\n"
+        "undefined8 __thiscall\n"
+        "std::_Vector_base<int,std::allocator<int>>::_M_allocate\n"
+        "          (_Vector_base<int,std::allocator<int>> *this,ulong param_1)\n"
+        "{\n"
+        "  undefined8 uVar1;\n"
+        "  if (param_1 == 0) { uVar1 = 0; }\n"
+        "  else { uVar1 = __new_allocator<int>::allocate((ulong)this,(void *)param_1); }\n"
+        "  return uVar1;\n"
+        "}\n"
+    )
+    # std:: even though the raw-file stem ("_M_allocate") drops the namespace.
+    assert ai_improver.should_improve(code, name="_M_allocate") is False
+
+
+def test_should_improve_skips_c_runtime_by_name():
+    """C-runtime symbols (__cxa_*, _Unwind_*, _ITM_*) are not user code."""
+    code = (
+        "void __cxa_finalize(void)\n"
+        "{\n"
+        "  /* filler */\n"
+        "  int x = 0;\n"
+        "  int y = 1;\n"
+        "  int z = x + y;\n"
+        "  return;\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="__cxa_finalize-001021c0") is False
+
+
+def test_should_improve_skips_comment_heavy_stub():
+    """A halt_baddata() stub stays trivial once Ghidra's WARNING comments are
+    stripped, and is skipped despite carrying a param_N artifact."""
+    code = (
+        "/* WARNING: Control flow encountered bad instruction data */\n"
+        "/* WARNING: Unknown calling convention -- yet parameter storage is locked */\n"
+        "void mystery_thrower(char *param_1)\n"
+        "{\n"
+        "  /* WARNING: Bad instruction - Truncating control flow here */\n"
+        "  halt_baddata();\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="mystery_thrower") is False
+
+
+def test_should_improve_skips_plt_forwarding_thunk():
+    """A branch-free body that only calls its own symbol is a PLT import thunk."""
+    code = (
+        "/* WARNING: Unknown calling convention -- yet parameter storage is locked */\n"
+        "size_t strlen(char *__s)\n"
+        "{\n"
+        "  size_t sVar1;\n"
+        "  sVar1 = strlen(__s);\n"
+        "  return sVar1;\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="strlen") is False
+
+
+def test_should_improve_keeps_genuine_recursion():
+    """Real recursion calls itself but branches, so it is NOT a forwarding thunk."""
+    code = (
+        "int factorial(int param_1)\n"
+        "{\n"
+        "  if (param_1 <= 1) { return 1; }\n"
+        "  return param_1 * factorial(param_1 + -1);\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="factorial") is True
+
+
+def test_should_improve_keeps_user_namespaced_method():
+    """A method in the user's own class/namespace must still be improved."""
+    code = (
+        "void __thiscall User::User(User *this,int param_1,string *param_2)\n"
+        "{\n"
+        "  *(int *)this = param_1;\n"
+        "  std::__cxx11::string::string((string *)(this + 8),param_2);\n"
+        "  *(undefined8 *)(this + 0x40) = 0;\n"
+        "  return;\n"
+        "}\n"
+    )
+    assert ai_improver.should_improve(code, name="User") is True
+
+
 def test_score_prefers_artifact_heavy_code():
     """score_function ranks an artifact/branch-heavy function above a clean one."""
     clean = (

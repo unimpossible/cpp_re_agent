@@ -36,7 +36,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-contextual", action="store_true",
                    help="Run header synthesis but skip the per-function contextual refine.")
     p.add_argument("--limit", type=int, default=None,
-                   help="Cap the number of functions improved in stage 1.")
+                   help="Cap the number of functions actually improved in stage 1 "
+                        "(library/stub functions are skipped before counting).")
     args = p.parse_args(argv)
 
     if not os.path.exists(args.binary):

@@ -42,6 +42,57 @@ _ARTIFACT_RE = re.compile(
 # info or imports). FUN_-named functions almost always have artifacts to fix.
 _FUN_NAME_RE = re.compile(r"^FUN_[0-9a-fA-F]+$")
 
+# Demangled namespaces that mark a function as standard-library / runtime code.
+# Ghidra emits one decompiled .c per function across the *whole* statically
+# linked binary, so a typical output is dominated by libstdc++ template
+# instantiations and GNU extensions. These are already named and well
+# understood -- improving them just burns LLM calls on code the user is not
+# reverse-engineering.
+_LIBRARY_NAMESPACES = ("std::", "__gnu_cxx::", "__cxxabiv1::", "__cxx11::")
+
+# C-runtime / CRT / compiler-generated symbols that carry no namespace. Matched
+# against the (un)qualified name and the raw-file stem (which keeps the prefix).
+_LIBRARY_NAME_RE = re.compile(
+    r"^(?:"
+    r"__cxa_"                       # C++ ABI runtime (__cxa_finalize, ...)
+    r"|__cxxabiv"                   # C++ ABI internals
+    r"|_Unwind_"                    # stack unwinder
+    r"|_ITM_"                       # transactional-memory clone tables
+    r"|__gmon_start"               # profiling hook
+    r"|__libc_"                     # glibc startup/teardown
+    r"|__do_global_"               # static ctor/dtor runners
+    r"|_GLOBAL__sub_"              # per-TU static init/destruct
+    r"|register_tm_clones|deregister_tm_clones"
+    r"|frame_dummy"                # CRT init stub
+    r"|__stack_chk_"               # stack protector
+    r"|__throw_"                    # libstdc++ throw helpers (often bare stems)
+    r")"
+)
+
+# CRT entry/teardown stubs that forward into the runtime rather than calling
+# themselves, so the forwarding-thunk detector below misses them. Matched
+# exactly (these short names could otherwise be user-code prefixes).
+_LIBRARY_EXACT_NAMES = frozenset({
+    "_init", "_fini", "_start", "_dl_relocate_static_pie",
+})
+
+# Decompiler stubs for functions Ghidra could not recover (PLT entries, bad
+# instruction data, throw/abort helpers): the body is a single call to a
+# non-returning intrinsic. There is nothing to improve even though the stub
+# still carries param_N artifacts that would otherwise pass the gate.
+_STUB_BODY_RE = re.compile(
+    r"\{\s*(?:halt_baddata|_Unwind_Resume|__assert_fail|abort)\s*\([^;{}]*\)\s*;?\s*\}"
+)
+
+# C-style block comments and line comments. Ghidra fills decompiled output with
+# /* WARNING ... */ banners; stripping them first keeps the size heuristic from
+# treating a one-statement stub as a substantial function.
+_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _strip_comments(code: str) -> str:
+    return _COMMENT_RE.sub("", code)
+
 
 def _function_name(code: str):
     """Name of the first function definition in `code`, or None."""
@@ -53,6 +104,60 @@ def _function_name(code: str):
     return fn.name if fn else None
 
 
+_ADDR_SUFFIX_RE = re.compile(r"-[0-9a-fA-F]+$")
+
+
+def _base_names(candidate: str):
+    """
+    Plausible plain symbol names for a candidate, peeling off the things Ghidra
+    bolts on: a `Class::method` qualifier, a leading calling-convention token
+    (`processEntry _start`), and the `-<addr>` suffix on raw-file stems.
+    """
+    yield candidate
+    base = candidate.split("::")[-1]                 # drop Class:: qualifier
+    base = _ADDR_SUFFIX_RE.sub("", base)             # drop -<addr> file suffix
+    yield base
+    yield base.split()[-1] if base.split() else base  # drop "processEntry " etc.
+
+
+def _is_library_function(qualified: str = None, name: str = None) -> bool:
+    """
+    True when the function is standard-library / C-runtime code rather than the
+    user's own. Checks the qualified name parsed from the body (which carries
+    the `std::` namespace the raw-file stem drops) plus the passed-in name.
+    """
+    candidates = [c for c in (qualified, name) if c]
+    for c in candidates:
+        if any(c.startswith(ns) or f"::{ns}" in c for ns in _LIBRARY_NAMESPACES):
+            return True
+
+    bases = {b for c in candidates for b in _base_names(c)}
+    return any(_LIBRARY_NAME_RE.match(b) or b in _LIBRARY_EXACT_NAMES
+              for b in bases)
+
+
+def _is_stub(code: str) -> bool:
+    """A body whose only statement is a non-returning decompiler intrinsic."""
+    return bool(_STUB_BODY_RE.search(_strip_comments(code)))
+
+
+def _is_forwarding_thunk(code: str) -> bool:
+    """
+    A PLT/import thunk: a branch-free body whose only call is to the symbol of
+    the same name. Ghidra renders imported libc/libstdc++ symbols this way
+    (e.g. `strlen` calling `strlen`, `operator_new` calling `operator_new`).
+    The branch-free check distinguishes these from genuine recursion.
+    """
+    try:
+        items = scanner.scan_code(code)
+        fn = next((i for i in items if i.kind == "function"), None)
+        if not fn or set(fn.dependencies) != {fn.name}:
+            return False
+        return scanner.complexity_metrics(code)["cyclomatic"] == 1
+    except Exception:
+        return False
+
+
 def should_improve(code: str, name: str = None) -> bool:
     """
     Gate deciding whether a function is worth an LLM call. Conservative: it
@@ -60,22 +165,41 @@ def should_improve(code: str, name: str = None) -> bool:
     cost is a few wasted calls rather than silently dropping useful work.
 
     Skips:
-      - empty or trivially short bodies (< 5 non-blank lines);
-      - explicit thunks (`thunk_*`);
+      - standard-library / C-runtime code (`std::...`, `__cxa_*`, `_Unwind_*`,
+        etc.) -- the bulk of a statically linked binary, already named and not
+        what the user is reverse-engineering;
+      - empty or trivially short bodies (< 5 non-comment, non-blank lines);
+      - decompiler stubs whose only statement is a non-returning intrinsic
+        (e.g. `halt_baddata()`), even when they carry param_N artifacts;
+      - explicit thunks (`thunk_*`) and PLT import thunks (a branch-free body
+        forwarding to its own symbol, e.g. `strlen` calling `strlen`);
       - already-named, artifact-free functions (Ghidra had real symbols, e.g.
         from debug info or imports, so there is little readability to recover).
     """
     if not code or len(code.strip()) == 0:
         return False
 
-    lines = [l for l in code.splitlines() if l.strip()]
+    qualified = _function_name(code)
+    if name is None:
+        name = qualified
+
+    # Standard library / runtime code: nothing the user cares to recover.
+    if _is_library_function(qualified, name):
+        return False
+
+    # Count only real code lines: Ghidra emits many /* WARNING */ comment lines
+    # that would otherwise push a one-statement stub over the size threshold.
+    lines = [l for l in _strip_comments(code).splitlines() if l.strip()]
     if len(lines) < 5:
         return False
 
-    if name is None:
-        name = _function_name(code)
-
     if name and name.startswith("thunk_"):
+        return False
+
+    # A pure decompiler stub (single non-returning intrinsic call) or a PLT
+    # import thunk (forwards to its own symbol) has nothing to recover,
+    # regardless of the param_N artifacts in its signature.
+    if _is_stub(code) or _is_forwarding_thunk(code):
         return False
 
     # Real name + no decompiler artifacts => the decompiler already had symbols.
@@ -233,6 +357,7 @@ def improve_function(
     symbols=None,
     valid_names=None,
     base_prompt=None,
+    extra_context=None,
 ) -> str:
     """
     Sends the code to the selected LLM provider for improvement.
@@ -253,17 +378,22 @@ def improve_function(
         base_prompt: Optional base system instruction. Defaults to
             DEFAULT_SYSTEM_PROMPT; the experiment framework injects evolved
             prompt variants here.
+        extra_context: Optional pre-formatted context block to inject verbatim.
+            When supplied (even ""), it REPLACES the binary_path-based context
+            gathering, so the context-retrieval experiment controls exactly what
+            the model sees while reusing this same prompt assembly. None (default)
+            keeps the normal disk/symbol-map gathering.
     """
     if not should_improve(code):
         return code  # Return original if we skip
 
-    additional_context = ""
+    additional_context = "" if extra_context is None else extra_context
     owns_symbols = symbols is None
     if symbols is None:
         symbols = {}
     workspace_dir = None
 
-    if binary_path:
+    if binary_path and extra_context is None:
         bin_name = Path(binary_path).name
         workspace_dir = Path(os.getcwd()) / "workspace" / bin_name
         improved_dir = workspace_dir / "improved"

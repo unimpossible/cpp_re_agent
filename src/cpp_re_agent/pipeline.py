@@ -76,17 +76,20 @@ def batch_improve(functions: Dict[str, str], workspace: Path, binary_path: str,
     improved_dir = workspace / "improved"
     improved_dir.mkdir(parents=True, exist_ok=True)
 
-    if limit:
-        functions = dict(list(functions.items())[:limit])
-
     # Leaves-first so callers see improved callee signatures (via the symbol
     # map) as context; score only breaks ties so high-value fns go earlier.
+    # The callgraph spans all functions so ordering/dependencies stay correct
+    # even when `limit` later stops us early.
     graph = callgraph.build_callgraph(functions)
     scores = {n: ai_improver.score_function(c) for n, c in functions.items()}
     order = callgraph.topological_order(graph, priority=scores.get)
     valid_names = set(functions.keys())
     symbols = symbol_map.load_symbols(workspace)
 
+    # `limit` caps the number of functions actually improved (LLM calls), not
+    # how many we look at: library/stub/already-improved functions are filtered
+    # out *before* they count against the budget, so e.g. --limit 40 improves 40
+    # real functions rather than burning the budget skipping libstdc++ code.
     total = len(order)
     for i, name in enumerate(order):
         code = functions[name]
@@ -99,6 +102,9 @@ def batch_improve(functions: Dict[str, str], workspace: Path, binary_path: str,
             status(f"[{i + 1}/{total}] {name}: already improved (skip)")
             result.skipped.append(name)
         elif ai_improver.should_improve(code, name=name):
+            if limit is not None and len(result.improved) >= limit:
+                status(f"reached --limit ({limit}); stopping")
+                break
             status(f"[{i + 1}/{total}] {name}: improving (LLM)...")
             t0 = time.time()
             try:
@@ -120,6 +126,8 @@ def batch_improve(functions: Dict[str, str], workspace: Path, binary_path: str,
         if on_progress:
             on_progress((i + 1) / total)
 
+    if on_progress:
+        on_progress(1.0)
     symbol_map.save_symbols(workspace, symbols)
     return result
 
