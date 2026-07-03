@@ -5,6 +5,9 @@
 # improved output per case, then score with run_eval.py.
 set -euo pipefail
 
+# Compiler is overridable so CI can matrix over g++ / clang++.
+CXX="${CXX:-g++}"
+
 cd "$(dirname "$0")"
 mkdir -p bin
 
@@ -12,8 +15,8 @@ for src in corpus/*.cpp; do
     case=$(basename "$src" .cpp)
     for opt in O0 O2; do
         out="bin/${case}-${opt}"
-        echo "g++ -${opt} -g0 ${src} -> ${out}"
-        g++ "-${opt}" -g0 -o "$out" "$src"
+        echo "${CXX} -${opt} -g0 ${src} -> ${out}"
+        "$CXX" "-${opt}" -g0 -o "$out" "$src"
     done
 done
 

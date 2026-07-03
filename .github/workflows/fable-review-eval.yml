@@ -1,0 +1,94 @@
+name: Fable Review Eval
+
+# Builds the eval corpus into binaries and runs the decompilation similarity
+# harness in fable-review/eval. The eval job is fully offline (it scores the
+# checked-in mock raw/improved examples) so it needs no Ghidra or LLM access.
+#
+# Run it from the Actions tab (workflow_dispatch), or it triggers automatically
+# on pushes / PRs that touch the harness.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "fable-review/**"
+      - ".github/workflows/fable-review-eval.yml"
+  pull_request:
+    paths:
+      - "fable-review/**"
+      - ".github/workflows/fable-review-eval.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fable-review/eval
+
+jobs:
+  build-binaries:
+    name: Build corpus (${{ matrix.cxx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile corpus at -O0 and -O2
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: ./build_binaries.sh
+
+      - name: Smoke-test the binaries run
+        run: |
+          for bin in bin/*; do
+            echo "--- $bin ---"
+            "./$bin" || true
+          done
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-binaries-${{ matrix.cxx }}
+          path: fable-review/eval/bin/
+          if-no-files-found: error
+
+  eval:
+    name: Run similarity eval + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: fable-review/eval/requirements.txt
+
+      - name: Install eval dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run harness tests
+        run: pytest tests -v
+
+      - name: Score example candidates (improved vs raw baseline)
+        run: |
+          {
+            echo '### Decompilation similarity eval'
+            echo ''
+            echo '```'
+            python run_eval.py \
+              --candidates examples/improved \
+              --compare examples/raw \
+              --json results.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: fable-review/eval/results.json
+          if-no-files-found: error

@@ -38,6 +38,18 @@ Run the tests (they pin the key invariant: improved must outscore raw):
 pytest fable-review/eval/tests -v
 ```
 
+## CI
+
+`.github/workflows/fable-review-eval.yml` runs this harness on GitHub. Trigger
+it from the **Actions** tab (`Run workflow`), or it fires automatically on
+pushes/PRs touching `fable-review/`. It has two jobs:
+
+- **build-binaries** — compiles the corpus at `-O0`/`-O2` with both `g++` and
+  `clang++`, smoke-tests that each binary runs, and uploads them as artifacts.
+- **eval** — installs `requirements.txt`, runs the tests, scores
+  `examples/improved` against the `examples/raw` baseline (printing the table
+  to the run summary), and uploads `results.json`.
+
 ## Full loop (with Ghidra)
 
 1. `./build_binaries.sh` — compiles the corpus at `-O0` and `-O2` into `bin/`.
