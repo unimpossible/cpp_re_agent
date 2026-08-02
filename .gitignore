@@ -37,6 +37,9 @@ chroma_db/
 *.obj
 hello_world
 
+# Eval harness build output
+fable-review/eval/bin/
+
 # IDEs
 .vscode/
 .idea/
