@@ -16,6 +16,7 @@ dependencies = [
     "ghidrecomp",
     "python-dotenv",
     "chromadb",
+    "langchain",
     "langchain-openai",
     "langchain-google-genai",
     "langfuse",
