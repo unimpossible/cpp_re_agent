@@ -1,5 +1,0 @@
-# Dependencies for the fable-review similarity eval harness.
-# Offline: no Ghidra or LLM access required to run run_eval.py or the tests.
-pytest
-tree-sitter
-tree-sitter-cpp

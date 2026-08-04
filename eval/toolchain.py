@@ -31,14 +31,25 @@ def _run_wsl(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess
     )
 
 
-def compile_cpp(src: Path, out_bin: Path, std: str = DEFAULT_STD,
+def compile_cpp(src: Path | list[Path], out_bin: Path, std: str = DEFAULT_STD,
                 opt: str = DEFAULT_OPT, strip: bool = True) -> CompileResult:
-    """Compile `src` to `out_bin` with WSL g++, optionally stripping symbols."""
-    src_w = to_wsl_path(src)
+    """
+    Compile `src` to `out_bin` with WSL g++, optionally stripping symbols.
+
+    `src` is a single file or a list of translation units (multi-file programs
+    are linked into one binary, which is what the decompiler sees anyway). All
+    units are passed in one g++ invocation, so `#include "..."` resolves
+    relative to each source's own directory.
+    """
+    units = [src] if isinstance(src, Path) else list(src)
+    if not units:
+        return CompileResult(False, "no source files given", None)
+
+    src_w = [to_wsl_path(u) for u in units]
     out_w = to_wsl_path(out_bin)
     out_bin.parent.mkdir(parents=True, exist_ok=True)
 
-    proc = _run_wsl(["g++", f"-std={std}", opt, "-g0", "-o", out_w, src_w])
+    proc = _run_wsl(["g++", f"-std={std}", opt, "-g0", "-o", out_w, *src_w])
     if proc.returncode != 0:
         return CompileResult(False, proc.stderr.strip(), None)
 

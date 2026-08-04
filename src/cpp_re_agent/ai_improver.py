@@ -4,7 +4,7 @@ from pathlib import Path
 
 from . import scanner
 from . import symbol_map
-from .llm_factory import get_llm
+from .llm_factory import ImprovementError, get_llm
 
 _CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+|c)?\s*\n(.*?)```", re.DOTALL)
 
@@ -255,8 +255,16 @@ def _project_function_names(raw_dir: Path) -> set:
     return {p.stem for p in raw_dir.rglob("*.c")}
 
 
-def _dependencies(code: str, valid_names: set) -> list:
-    """Project functions called by `code`, filtered to known names."""
+def _dependencies(code: str, valid_names: set, index=None) -> list:
+    """
+    Project functions called by `code`, resolved to the names `valid_names`
+    uses. Matching goes through `scanner.NameIndex`: call sites carry a bare or
+    qualified name while `valid_names` holds ghidrecomp's `<symbol>-<address>`
+    stems, and a bare stem like `size` may belong to any of several functions.
+    Ambiguous calls resolve to nothing rather than to a guess.
+
+    `index` lets a batch caller build the index once instead of per function.
+    """
     try:
         items = scanner.scan_code(code)
     except Exception as e:
@@ -267,10 +275,21 @@ def _dependencies(code: str, valid_names: set) -> list:
     if not target or not target.dependencies:
         return []
 
-    deps = set(target.dependencies)
-    if valid_names:
-        deps &= valid_names
-        deps.discard(target.name)
+    if index is None:
+        if not valid_names:
+            return sorted(set(target.dependencies))
+        index = scanner.NameIndex(valid_names)
+
+    # `target.name` is the bare name from the source while a resolved dep is the
+    # `<symbol>-<address>` key, so self-recursion only shows up once normalized.
+    # Left unfiltered it makes a function its own dependency, and the recursive
+    # improve path would then try to improve it as its own callee.
+    own = scanner.normalize_name(target.name)
+    deps = set()
+    for dep in target.dependencies:
+        resolved = index.resolve(dep)
+        if resolved and scanner.normalize_name(resolved) != own:
+            deps.add(resolved)
     return sorted(deps)
 
 
@@ -439,10 +458,17 @@ def improve_function(
                         symbols=symbols,
                         valid_names=valid_names,
                     )
+                    # Same rule as the batch path: only cache output that parses,
+                    # since a written file is never revisited.
+                    if not scanner.is_valid_cpp(new_dep_code):
+                        raise ImprovementError("improved output does not parse as C++")
                     dep_improved_path.write_text(new_dep_code, encoding="utf-8")
                     symbol_map.record_improvement(symbols, dep, new_dep_code)
                 except Exception as e:
-                    print(f"Recursive improve failed for {dep}: {e}")
+                    msg = f"Recursive improve failed for {dep}: {e}"
+                    if status_callback:
+                        status_callback(msg)
+                    print(msg)
 
         # 1. Project types.
         if project_h.exists():
@@ -484,7 +510,10 @@ def improve_function(
 
         llm = get_llm(provider, model_name)
         if not llm:
-            return "// Error: LLM client could not be initialized (check API keys/env)."
+            raise ImprovementError(
+                f"LLM client could not be initialized for provider={provider} "
+                "(check API keys/env)."
+            )
 
         user_msg = f"{additional_context}Code to Improve:\n{code}"
         messages = [
@@ -499,10 +528,14 @@ def improve_function(
         result = _invoke_with_validation(
             llm, messages, status_callback=status_callback, stream_callback=stream_callback
         )
+    except ImprovementError:
+        raise
     except Exception as e:
-        return f"// Error during AI improvement: {str(e)}"
-
-    if owns_symbols and workspace_dir is not None:
-        symbol_map.save_symbols(workspace_dir, symbols)
+        raise ImprovementError(f"AI improvement failed: {e}") from e
+    finally:
+        # Persist whatever context we accumulated (including any recursively
+        # improved callees) even when this call failed.
+        if owns_symbols and workspace_dir is not None:
+            symbol_map.save_symbols(workspace_dir, symbols)
 
     return result

@@ -36,9 +36,13 @@ chroma_db/
 *.o
 *.obj
 hello_world
+inventory
+sample_app
 
 # Eval harness build output
-fable-review/eval/bin/
+eval/bin/
+# Per-model sweep workspaces (sweep_models.py)
+eval/runs/
 
 # IDEs
 .vscode/

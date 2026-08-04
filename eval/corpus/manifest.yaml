@@ -74,7 +74,39 @@ programs:
       function references only a subset of types (context-retrieval target).
     stdin_cases: [""]
 
-  # Seeded from the repo's existing examples.
+  # Multi-file: `path` is a directory, and every .h/.cpp under it is one
+  # program compiled into a single binary. `Program.source` concatenates them
+  # (headers first) so struct/function recovery is scored against the whole
+  # program, not one translation unit.
+  - id: tier4_taskflow
+    tier: 4
+    path: eval/corpus/tier4_taskflow
+    description: multi-file task scheduler (task/graph/metrics/scheduler/
+      workload/main across 5 headers + 6 TUs). Namespaced classes with private
+      members, enum classes, std::map/vector/sort/ostringstream, recursive DFS,
+      and a 7-level dependency graph. Cross-TU calls mean the decompiled
+      callgraph spans translation-unit boundaries, and shared headers make
+      project.h synthesis the whole point rather than a formality.
+    stdin_cases: [""]
+
+  # Merged in from the former fable-review/eval corpus (the similarity
+  # harness's own cases). They are scored by run_eval.py like any other case.
+  - id: checksum
+    tier: 1
+    path: eval/corpus/checksum.cpp
+    description: CRC/adler-style checksums over byte buffers; C-string handling.
+    stdin_cases: [""]
+
+  - id: inventory
+    tier: 1
+    path: eval/corpus/inventory.cpp
+    description: Item array with total_value / find_item; the case the model
+      sweep (sweep_models.py) runs against.
+    stdin_cases: [""]
+
+  # Seeded from the repo's existing examples. `examples/hello_world.cpp` is the
+  # single copy of this source — it doubles as the app's demo binary source and
+  # as the ground truth for the checked-in eval/examples/{raw,improved} fixture.
   - id: hello_world
     tier: 2
     path: examples/hello_world.cpp

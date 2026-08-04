@@ -604,6 +604,7 @@ def run_model_sweep(args) -> None:
     from cpp_re_agent import ai_improver, contextual_improver, knowledge_graph
     from . import chain as chain_mod
     from . import header as header_mod
+    from . import roundtrip
     from .dataset import _original_bodies
 
     random.seed(args.seed)
@@ -688,7 +689,10 @@ def run_model_sweep(args) -> None:
                     print(f"   {prog.id}: ERROR {res.error}")
                     continue
                 for name, refined_code in res.refined.items():
-                    orig = originals.get(roundtrip._normalize_name(name))
+                    # Identity, not bare name: two same-named methods on
+                    # different classes must not be scored against each other.
+                    raw_body = res.raw_functions.get(name, "")
+                    orig = originals.get(roundtrip.match_key(name, raw_body))
                     if not orig:
                         continue
                     raw = res.raw_functions.get(name, "")

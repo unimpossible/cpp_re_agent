@@ -13,14 +13,9 @@ authors = [
     {name = "unimpossible", email = "3935212+unimpossible@users.noreply.github.com"}
 ]
 dependencies = [
-    "streamlit",
     "ghidrecomp",
-    "google-generativeai",
-    "openai",
     "python-dotenv",
     "chromadb",
-    "langchain",
-    "langchain-community",
     "langchain-openai",
     "langchain-google-genai",
     "langfuse",
@@ -29,7 +24,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+# The eval harness: pyyaml reads corpus/manifest.yaml. tree-sitter is already a
+# runtime dep, and the offline half of eval/ needs nothing beyond it.
+dev = ["pytest", "pyyaml"]
 
 [project.scripts]
 cpp-re = "cpp_re_agent.cli:main"

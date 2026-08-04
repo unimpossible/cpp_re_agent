@@ -24,12 +24,18 @@ class FunctionExample:
 
 
 def _original_bodies(source: str) -> Dict[str, str]:
-    """normalized-name -> original function body."""
-    bodies: Dict[str, str] = {}
-    for item in scanner.scan_code(source):
-        if item.kind == "function":
-            bodies[roundtrip._normalize_name(item.name)] = item.body
-    return bodies
+    """
+    match-key -> original function body.
+
+    Keyed by identity (class + name + arity + param types), not bare name:
+    `Scheduler::reset` and `MetricsCollector::reset` are different functions,
+    and so are `describe(int)` and `describe(const Summary&)`. Keying on the
+    name let one silently overwrite the other, after which every decompiled
+    `reset` was scored against whichever original happened to be scanned last.
+    """
+    functions = roundtrip.original_functions(source)
+    index = roundtrip.build_match_index(functions)
+    return {key: functions[name] for key, name in index.items()}
 
 
 def build_function_dataset(programs: List[Program] | None = None,
@@ -44,10 +50,18 @@ def build_function_dataset(programs: List[Program] | None = None,
         originals = _original_bodies(prog.source)
         targets = roundtrip.decompiled_targets(prog)
         for name, decompiled in targets.items():
-            norm = roundtrip._normalize_name(name)
-            if skip_main and norm == "main":
+            if skip_main and roundtrip._normalize_name(name) == "main":
                 continue
-            original = originals.get(norm)
+            original = originals.get(roundtrip.match_key(name, decompiled))
+            if not original:
+                # Retry ignoring parameter types: the two sides can spell a
+                # type differently even when the function is unambiguous.
+                loose = {
+                    scanner.function_key(k).match_key(with_params=False): v
+                    for k, v in originals.items()
+                }
+                original = loose.get(
+                    scanner.function_key(name, decompiled).match_key(with_params=False))
             if not original:
                 continue
             examples.append(FunctionExample(

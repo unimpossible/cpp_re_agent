@@ -1,0 +1,135 @@
+name: CI
+
+# Three jobs, none of which need Ghidra or an LLM:
+#
+#   tests          — the full pytest suite against the installed package, on the
+#                    oldest supported Python and the development one.
+#   build-binaries — compiles the eval corpus with g++ and clang++ and checks
+#                    each binary runs.
+#   eval           — scores the checked-in mock raw/improved output, which is
+#                    the deterministic regression gate for output quality.
+#
+# The judged prompt-optimization experiments (eval/run_experiment.py) are NOT
+# run here: they need a live LLM.
+#
+# Run it from the Actions tab (workflow_dispatch), or it triggers automatically
+# on pushes / PRs that touch the code, the tests, or the harness.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "eval/**"
+      - "tests/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/eval.yml"
+  pull_request:
+    paths:
+      - "eval/**"
+      - "tests/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/eval.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Test suite (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and the version used for development. The floor
+        # catches things like unguarded 3.14-only imports.
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the package
+        run: pip install -e ".[dev]"
+
+      # No Ghidra and no LLM here: the suite mocks both. Anything needing them
+      # belongs in the eval job or a manual run.
+      - name: Run the full test suite
+        run: python -m pytest tests -v
+
+  build-binaries:
+    name: Build corpus (${{ matrix.cxx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile corpus at -O0 and -O2
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: ./eval/build_binaries.sh
+
+      - name: Smoke-test the binaries run
+        run: |
+          for bin in eval/bin/*; do
+            echo "--- $bin ---"
+            "./$bin" || true
+          done
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-binaries-${{ matrix.cxx }}
+          path: eval/bin/
+          if-no-files-found: error
+
+  eval:
+    name: Run similarity eval + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The offline half of eval/ only needs tree-sitter + pyyaml + pytest, so
+      # install those directly rather than the app's full runtime stack.
+      - name: Install eval dependencies
+        run: pip install pytest pyyaml tree-sitter tree-sitter-cpp pydantic
+
+      # The `tests` job runs the whole suite against the installed package;
+      # here it doubles as a check that the offline half of eval/ really does
+      # work with nothing but the five packages above.
+      - name: Run the similarity tests (offline deps only)
+        run: python -m pytest tests/test_similarity.py -v
+
+      - name: Score example candidates (improved vs raw baseline)
+        run: |
+          {
+            echo '### Decompilation similarity eval'
+            echo ''
+            echo '```'
+            python -m eval.run_eval \
+              --candidates eval/examples/improved \
+              --compare eval/examples/raw \
+              --json results.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: results.json
+          if-no-files-found: error

@@ -52,26 +52,81 @@ class RoundtripResult:
 
 
 def _normalize_name(name: str) -> str:
-    """Strip signature/namespace decoration so decompiled names can be matched."""
-    name = name.split("(")[0]                       # drop "(int, int)" from demangled
-    name = re.sub(r"-[0-9a-fA-F]+$", "", name)      # drop ghidrecomp -<address> suffix
-    name = name.split("::")[-1]                     # Class::method -> method
-    return re.sub(r"[^A-Za-z0-9_]", "", name).strip()
+    """
+    Bare identifier for a function, with decompiler decoration removed.
+
+    Kept for display and self-reference checks only. It is NOT an identity:
+    `Scheduler::reset` and `MetricsCollector::reset` both normalize to `reset`,
+    as do `describe(int)` and `describe(const Summary&)`. Use `match_key` to
+    pair functions across the original/decompiled boundary.
+    """
+    return scanner.normalize_name(name)
 
 
-def _select_targets(all_funcs: Dict[str, str], original_names: List[str]) -> Dict[str, str]:
+def match_key(name: str, code: str = "") -> str:
+    """
+    Namespace-insensitive identity used to pair an original function with its
+    decompiled counterpart: enclosing class + method + arity + parameter types.
+
+    Matching on the bare name instead silently pairs a decompiled function with
+    a *different* original of the same name, which then scores recovered code
+    against source it was never compiled from.
+    """
+    return scanner.function_key(name, code).match_key()
+
+
+def build_match_index(items: Dict[str, str]) -> Dict[str, str]:
+    """
+    match_key -> name, dropping any key claimed by more than one function.
+
+    A collision here means we cannot tell two functions apart, so neither is
+    paired. Losing a sample is a gap in coverage; pairing the wrong one is a
+    silently wrong score.
+    """
+    seen: Dict[str, List[str]] = {}
+    for name, code in items.items():
+        seen.setdefault(match_key(name, code), []).append(name)
+    dropped = {k: v for k, v in seen.items() if len(v) > 1}
+    if dropped:
+        for key, names in sorted(dropped.items()):
+            print(f"[roundtrip] WARNING: ambiguous match key {key!r} shared by "
+                  f"{len(names)} functions ({', '.join(sorted(names)[:4])}); skipping")
+    return {k: v[0] for k, v in seen.items() if len(v) == 1}
+
+
+def _select_targets(all_funcs: Dict[str, str], original_names: List[str],
+                    original_bodies: Dict[str, str] | None = None) -> Dict[str, str]:
     """
     Pick the decompiled functions that correspond to the original program's
-    functions. Primary: fuzzy name match to the original. Fallback (e.g. names
-    lost to stripping): everything that isn't CRT glue and is worth improving.
+    functions. Primary: identity match (class + name + arity + param types) to
+    the original. Fallback (e.g. names lost to stripping): everything that isn't
+    CRT glue and is worth improving.
     """
-    norm_orig = {_normalize_name(n) for n in original_names}
+    if original_bodies:
+        want = set(build_match_index(original_bodies))
+    else:
+        want = {match_key(n) for n in original_names}
+
     matched = {
         name: code for name, code in all_funcs.items()
-        if _normalize_name(name) in norm_orig
+        if match_key(name, code) in want
     }
     if matched:
         return matched
+
+    # Same identity, but ignoring parameter types — the original and the
+    # decompilation can disagree on a type spelling we failed to normalize.
+    loose = {scanner.function_key(n).match_key(with_params=False)
+             for n in (original_bodies or {})} or {
+             scanner.function_key(n).match_key(with_params=False)
+             for n in original_names}
+    matched = {
+        name: code for name, code in all_funcs.items()
+        if scanner.function_key(name, code).match_key(with_params=False) in loose
+    }
+    if matched:
+        return matched
+
     return {
         name: code for name, code in all_funcs.items()
         if name not in _CRT_DENYLIST and not name.startswith("_")
@@ -128,7 +183,7 @@ def _decompiled_functions(program: Program) -> Dict[str, str]:
     # strip=False for now: keeping symbols lets us match decompiled functions to
     # the original by name, giving clean per-function signal. Stripping is a
     # planned difficulty axis (see NOTES.md), wired as a future knob.
-    res = toolchain.compile_cpp(program.path, binary, strip=False)
+    res = toolchain.compile_cpp(program.translation_units, binary, strip=False)
     if not res.ok:
         raise RuntimeError(f"compile failed: {res.stderr}")
 
@@ -142,6 +197,23 @@ def _decompiled_functions(program: Program) -> Dict[str, str]:
     return funcs
 
 
+def original_functions(source: str) -> Dict[str, str]:
+    """
+    name -> body for every function defined in an original program.
+
+    Keyed by the scanner's name, which can repeat across overloads and classes;
+    use `build_match_index` on the result when you need identity.
+    """
+    out: Dict[str, str] = {}
+    for item in scanner.scan_code(source):
+        if item.kind != "function":
+            continue
+        # Overloads share a name, so disambiguate the dict key by identity.
+        key = item.name if item.name not in out else f"{item.name}#{match_key(item.name, item.body)}"
+        out[key] = item.body
+    return out
+
+
 def decompiled_targets(program: Program) -> Dict[str, str]:
     """
     Public accessor: the selected decompiled target functions for a program
@@ -149,19 +221,16 @@ def decompiled_targets(program: Program) -> Dict[str, str]:
     optimization dataset without running the improve step.
     """
     all_funcs = _decompiled_functions(program)
-    original_names = [
-        it.name for it in scanner.scan_code(program.source) if it.kind == "function"
-    ]
-    return _select_targets(all_funcs, original_names)
+    originals = original_functions(program.source)
+    return _select_targets(all_funcs, list(originals), originals)
 
 
 def run_roundtrip(program: Program, improve_fn: Callable[[str], str],
                   status: Callable[[str], None] | None = None) -> RoundtripResult:
     """Run one program through compile -> decompile (cached) -> improve."""
     timings: Dict[str, float] = {}
-    original_names = [
-        it.name for it in scanner.scan_code(program.source) if it.kind == "function"
-    ]
+    originals = original_functions(program.source)
+    original_names = list(originals)
 
     def _log(msg):
         if status:
@@ -173,7 +242,7 @@ def run_roundtrip(program: Program, improve_fn: Callable[[str], str],
         all_funcs = _decompiled_functions(program)
         timings["compile_decompile"] = time.time() - t0
 
-        targets = _select_targets(all_funcs, original_names)
+        targets = _select_targets(all_funcs, original_names, originals)
         groups, reps = _dedup_targets(targets)
         dupes = len(targets) - len(reps)
         _log(f"{len(targets)} target function(s); {len(reps)} unique"

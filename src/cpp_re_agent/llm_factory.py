@@ -1,34 +1,56 @@
 import os
+import sys
+
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-"""
-Patch pydantic v1 for Python 3.14 (PEP 649 deferred annotations).
-
-Import this module before importing any pydantic v1 models (e.g., langfuse).
-"""
-
-import annotationlib
-
-import pydantic.v1.main as pydantic_main
-
-_orig = pydantic_main.ModelMetaclass.__new__
 
 
-def _patched(mcs, name, bases, ns, **kw):
-    if not ns.get("__annotations__") and "__annotate_func__" in ns:
-        try:
-            ns["__annotations__"] = ns["__annotate_func__"](annotationlib.Format.VALUE)
-        except Exception:
-            pass
-    return _orig(mcs, name, bases, ns, **kw)
+def _patch_pydantic_v1_for_py314() -> None:
+    """
+    Teach pydantic v1 about PEP 649 deferred annotations.
+
+    On Python 3.14 a class body carries `__annotate_func__` instead of a
+    populated `__annotations__`, which pydantic v1 (vendored inside langfuse)
+    does not know about. Must run before any pydantic v1 model is imported.
+
+    Guarded by version: `annotationlib` is 3.14+, so importing it unconditionally
+    breaks every supported older interpreter — including the 3.11 CI runs.
+    """
+    if sys.version_info < (3, 14):
+        return
+    import annotationlib
+    import pydantic.v1.main as pydantic_main
+
+    original = pydantic_main.ModelMetaclass.__new__
+
+    def patched(mcs, name, bases, ns, **kw):
+        if not ns.get("__annotations__") and "__annotate_func__" in ns:
+            try:
+                ns["__annotations__"] = ns["__annotate_func__"](annotationlib.Format.VALUE)
+            except Exception:
+                pass
+        return original(mcs, name, bases, ns, **kw)
+
+    pydantic_main.ModelMetaclass.__new__ = staticmethod(patched)
 
 
-pydantic_main.ModelMetaclass.__new__ = staticmethod(_patched)
-from langfuse.langchain import CallbackHandler
+_patch_pydantic_v1_for_py314()
+
+from langfuse.langchain import CallbackHandler  # noqa: E402  (must follow the patch)
 
 load_dotenv()
 
+
+class ImprovementError(Exception):
+    """
+    An LLM improvement/refinement call failed.
+
+    Raised instead of returning error text as if it were code: a returned
+    `"// Error: ..."` string is indistinguishable from a result to callers that
+    write it to disk or cache it, which turns one transient failure into a
+    permanently poisoned workspace.
+    """
 
 
 def get_llm(provider="local", model_name="openai/gpt-oss-20b"):

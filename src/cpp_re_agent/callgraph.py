@@ -10,8 +10,16 @@ def build_callgraph(functions: Dict[str, str]) -> Dict[str, Set[str]]:
     Each node maps to the set of *project* functions it calls. Calls to
     functions not present in `functions` (stdlib, imports, thunks we don't have)
     are dropped so the graph only contains edges we can actually act on.
+
+    `functions` is keyed by ghidrecomp's `<symbol>-<address>` file stem, which
+    call sites never use — and the stem drops the class, so one binary can hold
+    eight unrelated functions all stemmed `size`. Matching therefore goes
+    through `scanner.NameIndex`, which resolves on the demangled
+    qualifier/arity and returns nothing when a name is ambiguous. An edge we
+    can't pin down is left out rather than guessed: a wrong edge reorders the
+    batch and feeds the wrong callee signature into a prompt.
     """
-    names = set(functions.keys())
+    index = scanner.NameIndex(functions)
     graph: Dict[str, Set[str]] = {}
 
     for name, code in functions.items():
@@ -21,8 +29,9 @@ def build_callgraph(functions: Dict[str, str]) -> Dict[str, Set[str]]:
                 if item.kind != "function":
                     continue
                 for dep in item.dependencies:
-                    if dep in names and dep != name:
-                        deps.add(dep)
+                    target = index.resolve(dep)
+                    if target and target != name:
+                        deps.add(target)
         except Exception as e:
             print(f"Callgraph scan warning for {name}: {e}")
         graph[name] = deps
@@ -80,3 +89,33 @@ def topological_order(graph: Dict[str, Set[str]], priority=None) -> List[str]:
                     order.append(node)
 
     return order
+
+
+def topological_levels(graph: Dict[str, Set[str]], priority=None) -> List[List[str]]:
+    """
+    Groups `graph` into dependency levels. Level 0 holds functions with no
+    project callees; every function in level N calls only functions in levels
+    below N. Functions *within* a level have no dependency on one another, so
+    they can be improved concurrently without breaking the leaves-first
+    guarantee that `topological_order` provides.
+
+    Flattening the result yields a valid leaves-first order. Levels are derived
+    from `topological_order`, so cycles are broken the same way (a back-edge to
+    a not-yet-levelled node is ignored) and `priority` has the same tie-breaking
+    effect, here on the order of functions inside each level.
+    """
+    order = topological_order(graph, priority)
+    depth: Dict[str, int] = {}
+    levels: List[List[str]] = []
+
+    for node in order:
+        # Callees always precede their callers in `order`, so any dep missing
+        # from `depth` is a cycle back-edge that topological_order already cut.
+        d = max((depth[dep] + 1 for dep in graph.get(node, ()) if dep in depth),
+                default=0)
+        depth[node] = d
+        while len(levels) <= d:
+            levels.append([])
+        levels[d].append(node)
+
+    return levels

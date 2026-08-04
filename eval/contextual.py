@@ -21,14 +21,15 @@ from .corpus import Program
 from .dataset import FunctionExample
 
 
-def program_context(program: Program) -> Tuple[str, Dict[str, str]]:
+def program_context(program: Program) -> Tuple[str, Dict[str, List[str]]]:
     """
-    Returns (project_header_text, {normalized_func_name: signature}) for a
+    Returns (project_header_text, {bare_func_name: [signatures]}) for a
     program, extracted from its ORIGINAL source — the ideal context the
-    contextual prompt is meant to exploit.
+    contextual prompt is meant to exploit. The value is a list because a bare
+    name can cover several overloads.
     """
     type_defs: List[str] = []
-    sigs: Dict[str, str] = {}
+    sigs: Dict[str, List[str]] = {}
     for item in scanner.scan_code(program.source):
         if item.kind in ("struct", "class"):
             type_defs.append(item.body)
@@ -36,12 +37,17 @@ def program_context(program: Program) -> Tuple[str, Dict[str, str]]:
             res = symbol_map.extract_signature(item.body)
             if res:
                 name, sig = res
-                sigs[roundtrip._normalize_name(name)] = sig
+                # A list per name: overloads and same-named methods on
+                # different classes would otherwise overwrite each other, and
+                # every function but the last would vanish from the context.
+                bucket = sigs.setdefault(roundtrip._normalize_name(name), [])
+                if sig not in bucket:
+                    bucket.append(sig)
     header = "\n\n".join(type_defs) if type_defs else "// (no project types)"
     return header, sigs
 
 
-def callee_context(original_body: str, sigs: Dict[str, str], self_name: str) -> str:
+def callee_context(original_body: str, sigs: Dict[str, List[str]], self_name: str) -> str:
     """Signatures of the functions this one calls; falls back to all siblings."""
     deps: List[str] = []
     for item in scanner.scan_code(original_body):
@@ -49,9 +55,11 @@ def callee_context(original_body: str, sigs: Dict[str, str], self_name: str) -> 
             deps = item.dependencies
             break
     callees = {roundtrip._normalize_name(d) for d in deps}
-    lines = [f"{sigs[c]};" for c in sorted(callees) if c in sigs and c != self_name]
+    # A bare call site names the whole overload set; show all of it.
+    lines = [f"{s};" for c in sorted(callees) if c != self_name
+             for s in sigs.get(c, [])]
     if not lines:  # no project callees — give sibling signatures as context
-        lines = [f"{s};" for n, s in sigs.items() if n != self_name]
+        lines = [f"{s};" for n, group in sigs.items() if n != self_name for s in group]
     return "\n".join(lines) if lines else "// (no related functions)"
 
 

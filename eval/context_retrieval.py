@@ -39,13 +39,17 @@ from .dataset import FunctionExample
 @dataclass
 class ProgramTypes:
     """A program's reusable context universe, extracted from its ORIGINAL source."""
-    types: Dict[str, str]   # type name -> full struct/class definition
-    sigs: Dict[str, str]    # normalized function name -> signature (no body)
+    types: Dict[str, str]        # type name -> full struct/class definition
+    # Bare function name -> every signature with that name. A list because
+    # overloads and same-named methods on different classes share a bare name;
+    # for *context* the whole set is the right answer (the model should see all
+    # candidates), unlike callgraph edges where guessing one would be wrong.
+    sigs: Dict[str, List[str]]
 
 
 def program_types(program: Program) -> ProgramTypes:
     types: Dict[str, str] = {}
-    sigs: Dict[str, str] = {}
+    sigs: Dict[str, List[str]] = {}
     for item in scanner.scan_code(program.source):
         if item.kind in ("struct", "class"):
             types[item.name] = item.body
@@ -53,7 +57,9 @@ def program_types(program: Program) -> ProgramTypes:
             res = symbol_map.extract_signature(item.body)
             if res:
                 name, sig = res
-                sigs[roundtrip._normalize_name(name)] = sig
+                bucket = sigs.setdefault(roundtrip._normalize_name(name), [])
+                if sig not in bucket:      # keep every overload, not the last one
+                    bucket.append(sig)
     return ProgramTypes(types, sigs)
 
 
@@ -97,8 +103,8 @@ def ctx_full_dump(pt: ProgramTypes, ex: FunctionExample,
     """Every project type + every sibling signature, padded with distractors."""
     self_norm = roundtrip._normalize_name(ex.name)
     type_defs = list(pt.types.values()) + list(distractor_types)
-    sigs = [s for n, s in pt.sigs.items() if n != self_norm] + list(distractor_sigs)
-    return _types_block(type_defs) + _sigs_block(sigs)
+    sigs = [s for n, group in pt.sigs.items() if n != self_norm for s in group]
+    return _types_block(type_defs) + _sigs_block(sigs + list(distractor_sigs))
 
 
 def ctx_static_deps(pt: ProgramTypes, ex: FunctionExample) -> str:
@@ -107,7 +113,10 @@ def ctx_static_deps(pt: ProgramTypes, ex: FunctionExample) -> str:
     self_norm = roundtrip._normalize_name(ex.name)
     type_defs = [pt.types[n] for n in _referenced(pt.types.keys(), ex.original)]
     deps = function_deps(ex.original)
-    callee_sigs = [pt.sigs[d] for d in deps if d in pt.sigs and d != self_norm]
+    # A call site names an overload set, not one function, so include every
+    # signature under that name — the oracle should show all of them.
+    callee_sigs = [s for d in deps if d != self_norm
+                   for s in pt.sigs.get(d, [])]
     return _types_block(type_defs) + _sigs_block(callee_sigs)
 
 
