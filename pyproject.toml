@@ -8,24 +8,35 @@ version = "0.1.0"
 description = "AI-powered C++ Reverse Engineering Agent"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
-    {name = "unimpossible", email = "3935212+unimpossible@users.noreply.github.com."}
+    {name = "unimpossible", email = "3935212+unimpossible@users.noreply.github.com"}
 ]
 dependencies = [
-    "streamlit",
     "ghidrecomp",
-    "google-generativeai",
-    "openai",
     "python-dotenv",
     "chromadb",
     "langchain",
-    "langchain-community",
     "langchain-openai",
     "langchain-google-genai",
+    "langfuse",
     "tree-sitter",
     "tree-sitter-cpp"
 ]
 
+[project.optional-dependencies]
+# The eval harness: pyyaml reads corpus/manifest.yaml. tree-sitter is already a
+# runtime dep, and the offline half of eval/ needs nothing beyond it.
+dev = ["pytest", "pyyaml"]
+
+[project.scripts]
+cpp-re = "cpp_re_agent.cli:main"
+
 [project.urls]
-Homepage = "https://github.com/yourusername/cpp_re_agent"
+Homepage = "https://github.com/unimpossible/cpp_re_agent"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

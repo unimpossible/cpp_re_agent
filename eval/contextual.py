@@ -1,0 +1,94 @@
+"""
+Contextual ("function merging") experiment.
+
+The contextual pass takes an already-improved function plus project types and the
+signatures of the functions it calls, and refines it for cross-function
+consistency. This harness measures whether that second pass moves a function
+CLOSER to the original than the first-pass improvement alone.
+
+Per function: first-pass improve (improve_fn) -> contextual refine (refine_fn)
+given project types + callee signatures extracted from the original program.
+Score both vs the original with the shared per-function metric; the headline is
+refined-minus-base (does the context pass help?).
+"""
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple
+
+from cpp_re_agent import scanner, symbol_map
+
+from . import roundtrip
+from .corpus import Program
+from .dataset import FunctionExample
+
+
+def program_context(program: Program) -> Tuple[str, Dict[str, List[str]]]:
+    """
+    Returns (project_header_text, {bare_func_name: [signatures]}) for a
+    program, extracted from its ORIGINAL source — the ideal context the
+    contextual prompt is meant to exploit. The value is a list because a bare
+    name can cover several overloads.
+    """
+    type_defs: List[str] = []
+    sigs: Dict[str, List[str]] = {}
+    for item in scanner.scan_code(program.source):
+        if item.kind in ("struct", "class"):
+            type_defs.append(item.body)
+        elif item.kind == "function":
+            res = symbol_map.extract_signature(item.body)
+            if res:
+                name, sig = res
+                # A list per name: overloads and same-named methods on
+                # different classes would otherwise overwrite each other, and
+                # every function but the last would vanish from the context.
+                bucket = sigs.setdefault(roundtrip._normalize_name(name), [])
+                if sig not in bucket:
+                    bucket.append(sig)
+    header = "\n\n".join(type_defs) if type_defs else "// (no project types)"
+    return header, sigs
+
+
+def callee_context(original_body: str, sigs: Dict[str, List[str]], self_name: str) -> str:
+    """Signatures of the functions this one calls; falls back to all siblings."""
+    deps: List[str] = []
+    for item in scanner.scan_code(original_body):
+        if item.kind == "function":
+            deps = item.dependencies
+            break
+    callees = {roundtrip._normalize_name(d) for d in deps}
+    # A bare call site names the whole overload set; show all of it.
+    lines = [f"{s};" for c in sorted(callees) if c != self_name
+             for s in sigs.get(c, [])]
+    if not lines:  # no project callees — give sibling signatures as context
+        lines = [f"{s};" for n, group in sigs.items() if n != self_name for s in group]
+    return "\n".join(lines) if lines else "// (no related functions)"
+
+
+@dataclass
+class ContextualResult:
+    name: str
+    original: str
+    decompiled: str
+    base_improved: str
+    refined: str
+    error: str | None = None
+
+
+def run_contextual_roundtrip(example: FunctionExample, header: str, callees: str,
+                             improve_fn: Callable[[str], str],
+                             refine_fn: Callable[[str, str, str], str],
+                             status: Callable[[str], None] | None = None
+                             ) -> ContextualResult:
+    """First-pass improve, then contextual refine with project + callee context."""
+    def _log(msg):
+        if status:
+            status(msg)
+    try:
+        _log("first-pass improve (LLM)...")
+        base_improved = improve_fn(example.decompiled)
+        _log("contextual refine (LLM)...")
+        refined = refine_fn(base_improved, header, callees)
+        return ContextualResult(example.name, example.original, example.decompiled,
+                                base_improved, refined)
+    except Exception as e:
+        return ContextualResult(example.name, example.original, example.decompiled,
+                                "", "", error=str(e))
