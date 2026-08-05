@@ -1,5 +1,5 @@
 from . import knowledge_graph
-from .llm_factory import ImprovementError, get_llm
+from .llm_factory import ImprovementError, require_llm, stream_text
 from .scanner import scan_code
 import os
 
@@ -71,17 +71,12 @@ def refine_function(target_code: str, project_header: str, callee_context: str,
         f"### Related Function Context (Callees)\n```cpp\n{callee_context}\n```\n\n"
         f"### Target Function to Improve\n```cpp\n{target_code}\n```\n"
     )
-    llm = get_llm(provider, model_name)
-    if not llm:
-        raise ImprovementError(
-            f"LLM client could not be initialized for provider={provider} "
-            "(check API keys/env)."
-        )
+    llm = require_llm(provider, model_name)
     try:
-        response = llm.invoke(prompt)
+        content = stream_text(llm, prompt)
     except Exception as e:
         raise ImprovementError(f"Contextual refinement failed: {e}") from e
-    return response.content.strip().replace("```cpp", "").replace("```", "")
+    return content.strip().replace("```cpp", "").replace("```", "")
 
 
 def run_contextual_improvement(target_code: str, project_header: str,

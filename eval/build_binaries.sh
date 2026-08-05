@@ -23,12 +23,18 @@ if [ ! -d "$CORPUS" ]; then
     exit 1
 fi
 
+# Every case is built twice: with symbols and stripped. Stripped is the honest
+# case — a shipped binary has no symbol table, so Ghidra names everything
+# FUN_<addr> and nothing downstream can lean on a name. Keeping both lets the
+# eval measure the gap between the two regimes rather than assume it.
 build() {  # build <case> <opt> <sources...>
     local case=$1 opt=$2
     shift 2
     local out="bin/${case}-${opt}"
-    echo "${CXX} -${opt} -g0 $* -> ${out}"
+    echo "${CXX} -${opt} -g0 $* -> ${out}{,-stripped}"
     "$CXX" "-${opt}" -g0 -std=c++17 -o "$out" "$@"
+    cp "$out" "${out}-stripped"
+    strip --strip-all "${out}-stripped"
 }
 
 shopt -s nullglob
@@ -49,6 +55,24 @@ for dir in "$CORPUS"/*/; do
     for opt in O0 O2; do
         build "$case" "$opt" "${units[@]}"
     done
+
+    # A shared object too, built from every unit that does NOT define main.
+    # A .so has no entry point — its roots are the exported functions — so it
+    # exercises a different shape of call graph than an executable, and its
+    # export table survives `strip` (the dynamic linker needs it).
+    lib_units=()
+    for u in "${units[@]}"; do
+        grep -qE '^[[:alnum:]_:<>* ]*\bmain[[:space:]]*\(' "$u" || lib_units+=("$u")
+    done
+    if [ ${#lib_units[@]} -gt 0 ]; then
+        for opt in O0 O2; do
+            out="bin/lib${case}-${opt}.so"
+            echo "${CXX} -${opt} -fPIC -shared ${lib_units[*]} -> ${out}{,-stripped}"
+            "$CXX" "-${opt}" -g0 -std=c++17 -fPIC -shared -o "$out" "${lib_units[@]}"
+            cp "$out" "${out}-stripped"
+            strip --strip-all "${out}-stripped"
+        done
+    fi
 done
 
 echo "Done. Binaries in $(pwd)/bin"

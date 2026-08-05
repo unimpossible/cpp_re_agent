@@ -19,13 +19,15 @@ import sys
 
 from . import decompiler, pipeline
 from .llm_factory import get_llm
+from .progress import Progress
 
 __version__ = "0.1.0"
 
 STAGES = {
-    "all": "improve + synthesize project.h + contextual refine",
+    "all": "improve + synthesize project.h + contextual refine + name",
     "header": "improve + synthesize project.h (no refine pass)",
     "improve": "stage 1 only: per-function improvement",
+    "name": "only the final naming pass, over an existing workspace",
 }
 
 
@@ -83,6 +85,18 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Cap how many functions are actually improved. "
                            "Library/stub functions are filtered out before "
                            "counting, so --limit 10 means 10 real functions.")
+    work.add_argument("--no-naming", action="store_true",
+                      help="Skip the final pass that names functions still "
+                           "left as FUN_<address>. That pass only runs when "
+                           "something is still unnamed, which in practice "
+                           "means a stripped binary.")
+    work.add_argument("--max-depth", type=int, default=None, metavar="N",
+                      help="Only improve functions within N calls of the entry "
+                           "point. Defaults to "
+                           f"{pipeline.DEFAULT_MAX_DEPTH} for a stripped binary "
+                           "(where nothing else separates the program from the "
+                           "libstdc++ linked into it) and off when symbols are "
+                           "present. Use 0 to disable.")
     work.add_argument("--dry-run", action="store_true",
                       help="Decompile and report what would be improved — "
                            "function counts, callgraph levels, parallel rounds — "
@@ -115,7 +129,8 @@ def _preflight(provider: str, model: str) -> str | None:
     return None
 
 
-def _dry_run(binary: str, output_dir, limit, workers: int, status) -> int:
+def _dry_run(binary: str, output_dir, limit, workers: int, status,
+             limit_depth=None) -> int:
     """Decompile (cached), then report the plan without calling an LLM."""
     import math
 
@@ -129,11 +144,32 @@ def _dry_run(binary: str, output_dir, limit, workers: int, status) -> int:
 
     improved_dir = workspace / "improved"
     done = {p.stem for p in improved_dir.glob("*.cpp")} if improved_dir.is_dir() else set()
-    todo = [n for n, c in functions.items()
-            if n not in done and ai_improver.should_improve(c, name=n)]
 
     graph = callgraph.build_callgraph(functions)
     scores = {n: ai_improver.score_function(c) for n, c in functions.items()}
+
+    # Mirror batch_improve's depth filter, or a dry run of a stripped binary
+    # would promise several hundred calls the real run will not make.
+    in_scope, depth_note = None, ""
+    depth_limit = limit_depth
+    if depth_limit is None and pipeline.looks_stripped(functions):
+        depth_limit = pipeline.DEFAULT_MAX_DEPTH
+    if depth_limit == 0:
+        depth_limit = None          # explicitly disabled
+    if depth_limit is not None:
+        entry = callgraph.primary_entry(graph)
+        reach = len(callgraph.reachable_from(graph, entry)) if entry else 0
+        if entry and reach >= pipeline.MIN_ENTRY_REACH * len(functions):
+            depths = callgraph.call_depths(graph, entry)
+            in_scope = {n for n, d in depths.items() if d <= depth_limit}
+            depth_note = (f"  (stripped: within {depth_limit} call(s) of "
+                          f"{entry})")
+        else:
+            depth_note = "  (stripped, but call graph too sparse to filter)"
+
+    todo = [n for n, c in functions.items()
+            if n not in done and (in_scope is None or n in in_scope)
+            and ai_improver.should_improve(c, name=n)]
     levels = [[n for n in level if n in todo]
               for level in callgraph.topological_levels(graph, priority=scores.get)]
     levels = [lv for lv in levels if lv]
@@ -146,7 +182,7 @@ def _dry_run(binary: str, output_dir, limit, workers: int, status) -> int:
     print(f"decompiled:      {len(functions)}")
     print(f"already improved:{len(done):>4}  (skipped on a real run)")
     print(f"library/stub:    {len(functions) - len(todo) - len(done):>4}  (filtered out)")
-    print(f"would improve:   {len(todo):>4}")
+    print(f"would improve:   {len(todo):>4}{depth_note}")
     print(f"callgraph levels:{len(levels):>4}  sizes={[len(lv) for lv in levels]}")
     print(f"LLM rounds:      {rounds:>4}  at --workers {workers} "
           f"({len(todo)} sequential)")
@@ -167,8 +203,23 @@ def main(argv=None) -> int:
     model = args.model or pipeline.default_model_for(args.provider)
     workspace = pipeline.workspace_for(args.binary, args.output_dir)
 
+    # One bar per stage, created by the pipeline. Held here so `status` can
+    # route through it: printing straight to stdout would scribble over the
+    # bar's line.
+    live: dict = {"bar": None}
+
+    def make_bar(label: str) -> Progress:
+        bar = Progress(0, enabled=not args.quiet, label=label)
+        live["bar"] = bar
+        return bar
+
     def status(msg):
-        if not args.quiet:
+        if args.quiet:
+            return
+        bar = live.get("bar")
+        if bar is not None and bar.enabled:
+            bar.note(msg)
+        else:
             print(msg)
 
     if not args.quiet:
@@ -185,20 +236,40 @@ def main(argv=None) -> int:
     try:
         if args.dry_run:
             return _dry_run(args.binary, args.output_dir, args.limit,
-                            args.workers, status)
+                            args.workers, status,
+                            limit_depth=args.max_depth)
 
         problem = _preflight(args.provider, model)
         if problem:
             print(f"error: {problem}", file=sys.stderr)
             return 2
 
+        if args.stages == "name":
+            # Naming needs nothing but an existing workspace, so it can be
+            # re-run on its own without paying for the two LLM stages again.
+            if not (workspace / "improved").is_dir():
+                print(f"error: no improved/ in {workspace} — run a full pass first",
+                      file=sys.stderr)
+                return 2
+            with make_bar("naming") as bar:
+                named = pipeline.run_naming(workspace, provider=args.provider,
+                                            model_name=model, status=status,
+                                            progress=bar,
+                                            max_workers=args.workers)
+            print("-" * 70)
+            print(f"named {len(named)} function(s)  ->  {workspace}")
+            return 0
+
         result = pipeline.run_all(
             args.binary, provider=args.provider, model_name=model,
             output_dir=args.output_dir, limit=args.limit,
             do_synthesis=args.stages != "improve",
             do_contextual=args.stages == "all",
+            do_naming=args.stages == "all" and not args.no_naming,
             max_workers=args.workers,
+            max_depth=args.max_depth,
             status=status,
+            progress_factory=make_bar,
         )
     except decompiler.DecompilationError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -211,7 +282,8 @@ def main(argv=None) -> int:
     print(f"improved {len(result.improved)}   skipped {len(result.skipped)}   "
           f"failed {len(result.failed)}   "
           f"project.h {'yes' if result.header_written else 'no'}   "
-          f"refined {len(result.refined)}")
+          f"refined {len(result.refined)}   "
+          f"named {len(result.named)}")
     print(f"output -> {result.workspace}")
     if result.failed:
         # Nothing was written for these, so a re-run retries them.
@@ -228,6 +300,7 @@ def main(argv=None) -> int:
             "skipped": result.skipped,
             "failed": result.failed,
             "refined": result.refined,
+            "named": result.named,
             "header_written": result.header_written,
         }
         with open(args.json_path, "w", encoding="utf-8") as f:

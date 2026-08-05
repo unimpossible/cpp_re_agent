@@ -4,7 +4,7 @@ from pathlib import Path
 
 from . import scanner
 from . import symbol_map
-from .llm_factory import ImprovementError, get_llm
+from .llm_factory import ImprovementError, require_llm, stream_text
 
 _CODE_BLOCK_RE = re.compile(r"```(?:cpp|c\+\+|c)?\s*\n(.*?)```", re.DOTALL)
 
@@ -296,25 +296,9 @@ def _dependencies(code: str, valid_names: set, index=None) -> list:
 def _stream_response(llm, convo, stream_callback=None) -> str:
     """
     Streams a single LLM response, forwarding the running text to
-    `stream_callback` as it arrives. Falls back to a blocking invoke if the
-    client does not support streaming. Returns the full raw response text.
+    `stream_callback` as it arrives. Returns the full raw response text.
     """
-    raw = ""
-    try:
-        for chunk in llm.stream(convo):
-            piece = getattr(chunk, "content", "") or ""
-            if piece:
-                raw += piece
-                if stream_callback:
-                    stream_callback(raw)
-        return raw
-    except (AttributeError, NotImplementedError):
-        # Client without streaming support: one blocking call.
-        response = llm.invoke(convo)
-        raw = response.content
-        if stream_callback:
-            stream_callback(raw)
-        return raw
+    return stream_text(llm, convo, on_chunk=stream_callback)
 
 
 def _invoke_with_validation(
@@ -508,12 +492,7 @@ def improve_function(
             endpoint = os.getenv("LOCAL_LLM_URL", "http://localhost:1234/v1") if provider == "local" else provider
             status_callback(f"Initializing LLM (provider={provider}, model={model_name}, endpoint={endpoint})...")
 
-        llm = get_llm(provider, model_name)
-        if not llm:
-            raise ImprovementError(
-                f"LLM client could not be initialized for provider={provider} "
-                "(check API keys/env)."
-            )
+        llm = require_llm(provider, model_name)
 
         user_msg = f"{additional_context}Code to Improve:\n{code}"
         messages = [

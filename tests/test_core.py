@@ -1,4 +1,5 @@
 import pytest
+import io
 import os
 import shutil
 from pathlib import Path
@@ -260,7 +261,7 @@ def test_improve_function_calls_llm(mock_llm_response):
     
     # Mock get_llm to return a mock object. improve_function streams the
     # response (llm.stream), so the mock must yield chunks with .content.
-    with patch("cpp_re_agent.ai_improver.get_llm") as mock_get_llm:
+    with patch("cpp_re_agent.llm_factory.get_llm") as mock_get_llm:
         mock_chain = MagicMock()
         mock_chain.stream.return_value = iter([mock_llm_response])
         mock_get_llm.return_value = mock_chain
@@ -319,7 +320,7 @@ def test_improve_function_raises_when_llm_unavailable():
     """A missing API key must raise, not return '// Error' text as if it were code."""
     from cpp_re_agent.llm_factory import ImprovementError
 
-    with patch("cpp_re_agent.ai_improver.get_llm", return_value=None):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=None):
         with pytest.raises(ImprovementError, match="could not be initialized"):
             ai_improver.improve_function(GNARLY, provider="gemini")
 
@@ -330,7 +331,7 @@ def test_improve_function_raises_on_llm_exception():
 
     llm = MagicMock()
     llm.stream.side_effect = RuntimeError("429 rate limit")
-    with patch("cpp_re_agent.ai_improver.get_llm", return_value=llm):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=llm):
         with pytest.raises(ImprovementError) as exc:
             ai_improver.improve_function(GNARLY, provider="local")
     # The underlying cause is preserved for the status line / st.error.
@@ -343,13 +344,15 @@ def test_refine_function_raises_instead_of_returning_error_text():
     from cpp_re_agent import contextual_improver
     from cpp_re_agent.llm_factory import ImprovementError
 
+    # refine_function streams (see llm_factory.stream_text), so the failure
+    # surfaces from .stream rather than .invoke.
     llm = MagicMock()
-    llm.invoke.side_effect = RuntimeError("connection reset")
-    with patch("cpp_re_agent.contextual_improver.get_llm", return_value=llm):
+    llm.stream.side_effect = RuntimeError("connection reset")
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=llm):
         with pytest.raises(ImprovementError, match="connection reset"):
             contextual_improver.refine_function("int f(){return 0;}", "// hdr", "// callees")
 
-    with patch("cpp_re_agent.contextual_improver.get_llm", return_value=None):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=None):
         with pytest.raises(ImprovementError, match="could not be initialized"):
             contextual_improver.refine_function("int f(){return 0;}", "// hdr", "// callees")
 
@@ -361,7 +364,7 @@ def test_batch_improve_writes_nothing_when_the_llm_fails(tmp_path):
     workspace = tmp_path / "ws"
     functions = {"FUN_00401000": GNARLY}
 
-    with patch("cpp_re_agent.ai_improver.get_llm", return_value=None):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=None):
         result = pipeline.batch_improve(
             functions, workspace, binary_path=None, provider="gemini")
 
@@ -384,13 +387,13 @@ def test_batch_improve_retries_a_failed_function_on_the_next_run(tmp_path):
     functions = {"FUN_00401000": GNARLY}
 
     # Run 1: endpoint is down.
-    with patch("cpp_re_agent.ai_improver.get_llm", return_value=None):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=None):
         first = pipeline.batch_improve(functions, workspace, None, provider="gemini")
     assert first.failed == ["FUN_00401000"]
 
     # Run 2: endpoint is back. Nothing was cached, so it is retried.
     good = "int process_record(int handle)\n{\n    return handle;\n}\n"
-    with patch("cpp_re_agent.ai_improver.get_llm", return_value=_streaming_llm(good)):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=_streaming_llm(good)):
         second = pipeline.batch_improve(functions, workspace, None, provider="local")
 
     improved = workspace / "improved" / "FUN_00401000.cpp"
@@ -412,7 +415,7 @@ def test_batch_improve_rejects_output_that_does_not_parse(tmp_path):
     functions = {"FUN_00401000": GNARLY}
     garbage = "Sure! Here is the improved function: int f( {{{ unbalanced"
 
-    with patch("cpp_re_agent.ai_improver.get_llm", return_value=_streaming_llm(garbage)):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=_streaming_llm(garbage)):
         result = pipeline.batch_improve(functions, workspace, None, provider="local")
 
     assert not (workspace / "improved" / "FUN_00401000.cpp").exists()
@@ -432,7 +435,7 @@ def test_run_contextual_keeps_prior_version_when_refinement_fails(tmp_path):
 
     llm = MagicMock()
     llm.invoke.side_effect = RuntimeError("500 server error")
-    with patch("cpp_re_agent.contextual_improver.get_llm", return_value=llm):
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=llm):
         refined = pipeline.run_contextual(workspace, status=lambda _m: None)
 
     assert refined == []
@@ -937,3 +940,597 @@ def test_get_functions_warns_about_unreadable_decompiled_files(workspace_dir, ca
     assert "alternate data stream" in out
     assert "1 decompiled file(s)" in out, "Ghidra project files must not be counted"
     assert "app.gpr" not in out
+
+
+# --- Progress reporting -----------------------------------------------------
+#
+# Stage 1 sits inside a few parallel LLM calls for minutes at a time. An
+# event-only log went silent for long stretches and never said how far along it
+# was, so the bar has to name what is in flight and estimate what is left.
+
+class _FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_format_duration_reads_naturally():
+    from cpp_re_agent.progress import format_duration
+
+    # Sub-10s keeps a decimal: a fast call rounding to "0s" reads as nothing.
+    assert format_duration(0.4) == "0.4s"
+    assert format_duration(7.4) == "7.4s"
+    assert format_duration(42) == "42s"
+    assert format_duration(92) == "1m32s"
+    assert format_duration(3600) == "1h00m"
+    assert format_duration(4210) == "1h10m"
+    assert format_duration(-5) == "0.0s"
+
+
+def test_progress_bar_reports_position_and_running_work():
+    from cpp_re_agent.progress import Progress
+
+    bar = Progress(4, stream=_FakeTTY(), width=10)
+    bar.start("alpha")
+    bar.start("beta")
+    rendered = bar.render()
+
+    # What is in flight is the thing that was missing during a long level.
+    assert "alpha" in rendered and "beta" in rendered
+    assert "0/4" in rendered
+
+    bar.finish("alpha", 12.0)
+    rendered = bar.render()
+    assert "1/4" in rendered
+    assert " 25%" in rendered
+    assert "alpha" not in rendered, "a finished unit must leave the running list"
+    assert "beta" in rendered
+
+
+def test_progress_eta_uses_throughput_not_mean_duration():
+    """
+    With N workers, mean-duration x remaining overestimates by ~N. Elapsed per
+    completed unit already has the real concurrency baked in.
+    """
+    from cpp_re_agent.progress import Progress
+
+    bar = Progress(10, stream=_FakeTTY())
+    bar._started_at -= 20.0          # 20s of wall clock has passed
+    for i in range(5):
+        bar.finish(f"f{i}", 15.0)    # each took 15s, but they overlapped
+
+    eta = bar._eta_seconds()
+    # 20s for 5 done -> 4s each -> ~20s for the remaining 5.
+    assert 15 < eta < 25, eta
+    assert eta < 5 * 15, "must not assume the calls were sequential"
+
+
+def test_progress_falls_back_to_plain_lines_without_a_tty():
+    """CI logs and pipes must not get carriage returns or escape codes."""
+    from cpp_re_agent.progress import Progress
+
+    out = io.StringIO()          # StringIO has no isatty() -> not live
+    bar = Progress(2, stream=out)
+    bar.start("alpha")
+    bar.finish("alpha", 3.0)
+    bar.note("level 1/2")
+    text = out.getvalue()
+
+    assert "\r" not in text and "\033" not in text
+    assert "alpha" in text and "level 1/2" in text
+
+
+def test_progress_disabled_is_inert():
+    from cpp_re_agent.progress import Progress
+
+    out = io.StringIO()
+    bar = Progress(5, stream=out, enabled=False)
+    bar.start("a")
+    bar.finish("a", 1.0)
+    bar.note("hello")
+    assert out.getvalue() == ""
+
+
+def test_batch_improve_reports_each_function_as_it_starts(tmp_path):
+    """
+    The original complaint: a level announced itself, then printed nothing
+    until a function finished. Workers must report at start, not just at end.
+    """
+    from cpp_re_agent import pipeline
+    from cpp_re_agent.progress import Progress
+
+    functions = {
+        f"FUN_0040{i}000": (
+            f"undefined4 FUN_0040{i}000(int param_1)\n{{\n"
+            + "\n".join(f"    int iVar{j} = param_1 + {j};" for j in range(12))
+            + "\n    return iVar1;\n}\n"
+        )
+        for i in range(3)
+    }
+
+    out = io.StringIO()
+    bar = Progress(0, stream=out)
+
+    def fake_improve(code, **kwargs):
+        name = next(n for n, c in functions.items() if c == code)
+        # Every function must already be announced by the time it runs.
+        assert name in out.getvalue(), f"{name} not reported at start"
+        return f"int {name}_improved(int handle)\n{{\n    return handle;\n}}\n"
+
+    with patch("cpp_re_agent.ai_improver.improve_function", side_effect=fake_improve):
+        result = pipeline.batch_improve(
+            functions, tmp_path / "ws", None, max_workers=2, progress=bar)
+
+    assert len(result.improved) == 3
+    text = out.getvalue()
+    for name in functions:
+        assert text.count(name) >= 2, f"{name} should be reported at start and finish"
+
+
+def test_batch_improve_totals_count_only_real_work(tmp_path):
+    """
+    'how much is left' must be measured against functions we will actually
+    improve, not every decompiled symbol — most of which are library noise.
+    """
+    from cpp_re_agent import pipeline
+    from cpp_re_agent.progress import Progress
+
+    real = ("undefined4 FUN_00401000(int param_1)\n{\n"
+            + "\n".join(f"    int iVar{j} = param_1 + {j};" for j in range(12))
+            + "\n    return iVar1;\n}\n")
+    functions = {
+        "FUN_00401000": real,
+        "__cxa_finalize-001021c0": "void __cxa_finalize(void)\n{\n  return;\n}\n",
+        "thunk_x": "void thunk_x(void)\n{\n  x();\n  return;\n}\n",
+    }
+
+    lines = []
+    bar = Progress(0, stream=io.StringIO())
+    with patch("cpp_re_agent.ai_improver.improve_function",
+               return_value="int f(int h)\n{\n    return h;\n}\n"):
+        pipeline.batch_improve(functions, tmp_path / "ws", None,
+                               status=lines.append, progress=bar)
+
+    assert bar.total == 1, "only the real function counts toward the total"
+    assert any("1 to improve" in line for line in lines), lines
+
+
+def test_progress_always_names_at_least_one_running_unit(monkeypatch):
+    """
+    When a level stalls, "+4 more" alone is useless — the whole reason to look
+    is to find out *which* call is slow, and for how long.
+    """
+    from cpp_re_agent import progress as progress_mod
+    from cpp_re_agent.progress import Progress
+
+    monkeypatch.setattr(progress_mod.Progress, "_term_width", lambda self: 100)
+
+    bar = Progress(76, stream=_FakeTTY(), label="stage 1")
+    bar.done, bar.failed = 18, 2
+    bar._started_at -= 745
+    now = __import__("time").monotonic()
+    for name, age in [("consolidate_catalog-0040a110", 142),
+                      ("emit_report-0040b220", 11),
+                      ("scan_line-0040c330", 6)]:
+        bar._running[name] = now - age
+
+    rendered = bar.render()
+    assert "running:" in rendered
+    # The name may be clipped to fit, but it must identify the slow call...
+    assert "consol" in rendered, "the longest-running unit must be named"
+    assert "emit_report" not in rendered, "shorter/newer units yield space first"
+    # ...and its elapsed time must survive, since "how slow" is the question.
+    assert "2m22s" in rendered
+    assert len(rendered) <= 100, f"must fit the terminal: {len(rendered)}"
+
+
+def test_progress_running_list_drops_out_on_a_narrow_terminal(monkeypatch):
+    from cpp_re_agent import progress as progress_mod
+    from cpp_re_agent.progress import Progress
+
+    monkeypatch.setattr(progress_mod.Progress, "_term_width", lambda self: 60)
+
+    bar = Progress(76, stream=_FakeTTY(), label="stage 1")
+    bar.done = 18
+    bar._running["some_long_function_name-00401820"] = __import__("time").monotonic()
+
+    rendered = bar.render()
+    assert "18/76" in rendered, "the bar itself is what matters when space is tight"
+    assert len(rendered) <= 60
+
+
+# --- Stripped binaries ------------------------------------------------------
+#
+# A shipped binary has no symbol table: Ghidra names everything FUN_<addr>, so
+# the name-based library filter goes blind and would send the whole statically
+# linked libstdc++ to the LLM. Measured on the tier4 corpus binary, the gate
+# went from keeping 67 functions to keeping 518. Call depth from the entry
+# point is what still separates the program from the library it links.
+
+def _stripped_program():
+    """A FUN_-named call graph: main -> app code -> a deep library chain."""
+    def body(name, calls=()):
+        lines = [f"    int iVar{j} = param_1 + {j};" for j in range(12)]
+        lines += [f"    {c}(param_1);" for c in calls]
+        return (f"undefined4 {name}(int param_1)\n{{\n"
+                + "\n".join(lines) + "\n    return iVar1;\n}\n")
+
+    return {
+        "FUN_00100000": body("FUN_00100000", ["FUN_00100100", "FUN_00100200"]),
+        "FUN_00100100": body("FUN_00100100", ["FUN_00100300"]),   # depth 1
+        "FUN_00100200": body("FUN_00100200"),                      # depth 1
+        "FUN_00100300": body("FUN_00100300", ["FUN_00100400"]),   # depth 2
+        "FUN_00100400": body("FUN_00100400", ["FUN_00100500"]),   # depth 3 (library)
+        "FUN_00100500": body("FUN_00100500"),                      # depth 4 (library)
+    }
+
+
+def test_looks_stripped_detects_missing_symbols():
+    from cpp_re_agent import pipeline
+
+    assert pipeline.looks_stripped(_stripped_program()) is True
+    assert pipeline.looks_stripped({
+        "main-00401000": "int main(void){return 0;}",
+        "process_order-00401100": "int process_order(int a){return a;}",
+    }) is False
+    assert pipeline.looks_stripped({}) is False
+
+
+def test_primary_entry_finds_main_without_any_symbol():
+    """
+    Nothing calls the entry point and it reaches most of the program — true
+    whether or not a `main` symbol survived stripping.
+    """
+    from cpp_re_agent import callgraph
+
+    graph = callgraph.build_callgraph(_stripped_program())
+    assert callgraph.primary_entry(graph) == "FUN_00100000"
+
+
+def test_call_depths_measure_hops_from_the_entry():
+    from cpp_re_agent import callgraph
+
+    graph = callgraph.build_callgraph(_stripped_program())
+    depths = callgraph.call_depths(graph, "FUN_00100000")
+
+    assert depths["FUN_00100000"] == 0
+    assert depths["FUN_00100100"] == 1 and depths["FUN_00100200"] == 1
+    assert depths["FUN_00100300"] == 2
+    assert depths["FUN_00100500"] == 4
+
+
+def test_stripped_binary_improves_only_near_the_entry(tmp_path):
+    """
+    The regression this exists to prevent: without the depth filter every
+    library function reached from main is sent to the LLM.
+    """
+    from cpp_re_agent import pipeline
+
+    functions = _stripped_program()
+    scheduled = []
+
+    def fake(code, **kwargs):
+        scheduled.append(next(n for n, c in functions.items() if c == code))
+        return "int recovered(int handle)\n{\n    return handle;\n}\n"
+
+    with patch("cpp_re_agent.ai_improver.improve_function", side_effect=fake):
+        pipeline.batch_improve(functions, tmp_path / "auto", None, max_workers=1)
+
+    # Auto-detected as stripped -> DEFAULT_MAX_DEPTH (2) hops from the entry.
+    assert "FUN_00100400" not in scheduled, "depth-3 library code must be skipped"
+    assert "FUN_00100500" not in scheduled, "depth-4 library code must be skipped"
+    assert {"FUN_00100000", "FUN_00100100", "FUN_00100200"} <= set(scheduled)
+
+    # An explicit depth reaches further.
+    deep = []
+    with patch("cpp_re_agent.ai_improver.improve_function",
+               side_effect=lambda code, **kw: (
+                   deep.append(next(n for n, c in functions.items() if c == code))
+                   or "int r(int h)\n{\n    return h;\n}\n")):
+        pipeline.batch_improve(functions, tmp_path / "deep", None,
+                               max_workers=1, max_depth=4)
+    assert "FUN_00100500" in deep
+
+
+def test_symbols_present_means_no_depth_filter(tmp_path):
+    """With real names the name filter is accurate; depth would only lose work."""
+    from cpp_re_agent import pipeline
+
+    def body(name):
+        return (f"undefined4 {name}(int param_1)\n{{\n"
+                + "\n".join(f"    int iVar{j} = param_1 + {j};" for j in range(12))
+                + "\n    return iVar1;\n}\n")
+
+    # Named (not FUN_) but artifact-heavy, so should_improve keeps them.
+    functions = {
+        "main-00100000": body("main").replace("    return iVar1;",
+                                              "    stage_one(param_1);\n    return iVar1;"),
+        "stage_one-00100100": body("stage_one").replace(
+            "    return iVar1;", "    stage_two(param_1);\n    return iVar1;"),
+        "stage_two-00100200": body("stage_two").replace(
+            "    return iVar1;", "    stage_three(param_1);\n    return iVar1;"),
+        "stage_three-00100300": body("stage_three"),
+    }
+    assert pipeline.looks_stripped(functions) is False
+
+    scheduled = []
+    with patch("cpp_re_agent.ai_improver.improve_function",
+               side_effect=lambda code, **kw: (
+                   scheduled.append(next(n for n, c in functions.items() if c == code))
+                   or "int r(int h)\n{\n    return h;\n}\n")):
+        pipeline.batch_improve(functions, tmp_path / "ws", None, max_workers=1)
+
+    assert "stage_three-00100300" in scheduled, \
+        "a deep but real-named function must not be filtered out"
+
+
+def test_disconnected_functions_are_all_treated_as_entries(tmp_path):
+    """
+    Unrelated functions with no calls between them are all roots, so all of
+    them are entry points and none is "deep library code". Measuring depth
+    from a single best root instead would keep one and discard the rest.
+    """
+    from cpp_re_agent import pipeline
+
+    # Four FUN_-named functions with no calls between them: looks stripped,
+    # but no entry point reaches more than itself.
+    functions = {
+        f"FUN_0040{i}000": (
+            f"undefined4 FUN_0040{i}000(int param_1)\n{{\n"
+            + "\n".join(f"    int iVar{j} = param_1 + {j};" for j in range(12))
+            + "\n    return iVar1;\n}\n"
+        )
+        for i in range(4)
+    }
+    assert pipeline.looks_stripped(functions) is True
+
+    lines, scheduled = [], []
+    with patch("cpp_re_agent.ai_improver.improve_function",
+               side_effect=lambda code, **kw: (
+                   scheduled.append(next(n for n, c in functions.items() if c == code))
+                   or "int r(int h)\n{\n    return h;\n}\n")):
+        pipeline.batch_improve(functions, tmp_path / "ws", None,
+                               max_workers=1, status=lines.append)
+
+    assert len(scheduled) == 4, "a disconnected graph must not gut the work list"
+
+
+def test_entry_points_are_all_roots_for_a_library():
+    """
+    A shared object has no `main`. Its entry points are the exported functions,
+    and no single root reaches the rest — picking only the biggest would treat
+    most of the library's own API as unreachable library noise.
+    """
+    from cpp_re_agent import callgraph
+
+    # Three independent exported functions, each over its own helper.
+    graph = {
+        "api_a": {"helper_a"}, "helper_a": set(),
+        "api_b": {"helper_b"}, "helper_b": set(),
+        "api_c": {"helper_c"}, "helper_c": set(),
+    }
+    entries = callgraph.entry_points(graph)
+    assert entries == ["api_a", "api_b", "api_c"]
+
+    depths = callgraph.call_depths(graph, entries)
+    assert depths["api_a"] == depths["api_b"] == depths["api_c"] == 0
+    assert depths["helper_c"] == 1
+
+    # An executable-shaped graph still resolves to its single entry.
+    exe = {"main": {"a"}, "a": {"b"}, "b": set(), "unused": set()}
+    assert callgraph.entry_points(exe) == ["main"]
+
+
+def test_levels_over_subset_restores_parallelism():
+    """
+    Levels over the whole graph serialize survivors that skipped functions sit
+    between. Measured on a stripped shared object: 112 functions worth
+    improving landed in 112 whole-graph levels, so every LLM call ran alone.
+    """
+    from cpp_re_agent import callgraph
+
+    # a -> lib1 -> b -> lib2 -> c : a, b, c are independent of one another
+    # once the library functions between them are filtered out.
+    graph = {
+        "a": {"lib1"}, "lib1": {"b"},
+        "b": {"lib2"}, "lib2": {"c"},
+        "c": set(),
+    }
+    whole = callgraph.topological_levels(graph)
+    assert max(len(lv) for lv in whole) == 1, "whole-graph levels are a chain"
+
+    # But a, b, c DO reach each other transitively, so ordering is preserved.
+    subset = callgraph.levels_over_subset(graph, {"a", "b", "c"})
+    flat = [n for lv in subset for n in lv]
+    assert flat.index("c") < flat.index("b") < flat.index("a")
+
+    # Genuinely independent survivors share a level.
+    graph2 = {"x": {"libx"}, "libx": set(), "y": {"liby"}, "liby": set()}
+    levels2 = callgraph.levels_over_subset(graph2, {"x", "y"})
+    assert levels2 == [["x", "y"]], levels2
+
+
+# --- Stage 2 parallelism ----------------------------------------------------
+#
+# Unlike stage 1, the refine pass has no ordering constraint: project.h and the
+# stage-1 signature map are both fixed before it starts, and no refinement
+# feeds another. So it runs at full width rather than in callgraph levels.
+
+def _workspace_with_improved(tmp_path, count=4):
+    ws = tmp_path / "ws"
+    improved = ws / "improved"
+    improved.mkdir(parents=True)
+    for i in range(count):
+        (improved / f"fn_{i}.cpp").write_text(
+            f"int fn_{i}(int handle)\n{{\n    return handle + {i};\n}}\n",
+            encoding="utf-8")
+    (ws / "project.h").write_text("struct Order { int id; };\n", encoding="utf-8")
+    return ws
+
+
+def test_run_contextual_refines_concurrently(tmp_path):
+    """Deadlocks (and fails) unless four refinements are in flight at once."""
+    import threading
+    from cpp_re_agent import pipeline
+
+    ws = _workspace_with_improved(tmp_path, count=4)
+    barrier = threading.Barrier(4, timeout=10)
+
+    def fake(code, header, callees, **kwargs):
+        barrier.wait()
+        return "int refined(int handle)\n{\n    return handle;\n}\n"
+
+    with patch("cpp_re_agent.contextual_improver.refine_function", side_effect=fake):
+        refined = pipeline.run_contextual(ws, status=lambda m: None, max_workers=4)
+
+    assert sorted(refined) == ["fn_0", "fn_1", "fn_2", "fn_3"]
+    for i in range(4):
+        assert "refined" in (ws / "improved" / f"fn_{i}.cpp").read_text()
+
+
+def test_run_contextual_max_workers_1_stays_sequential(tmp_path):
+    import threading
+    import time as _time
+    from cpp_re_agent import pipeline
+
+    ws = _workspace_with_improved(tmp_path, count=3)
+    concurrent, peak = 0, 0
+    lock = threading.Lock()
+
+    def fake(code, header, callees, **kwargs):
+        nonlocal concurrent, peak
+        with lock:
+            concurrent += 1
+            peak = max(peak, concurrent)
+        _time.sleep(0.01)
+        with lock:
+            concurrent -= 1
+        return "int refined(int handle)\n{\n    return handle;\n}\n"
+
+    with patch("cpp_re_agent.contextual_improver.refine_function", side_effect=fake):
+        pipeline.run_contextual(ws, status=lambda m: None, max_workers=1)
+
+    assert peak == 1, f"max_workers=1 must not overlap calls (peak={peak})"
+
+
+def test_run_contextual_isolates_failures_and_keeps_prior_output(tmp_path):
+    """A failed or unparseable refinement must leave the stage-1 version alone."""
+    from cpp_re_agent import pipeline
+
+    ws = _workspace_with_improved(tmp_path, count=4)
+    original = (ws / "improved" / "fn_1.cpp").read_text()
+
+    def fake(code, header, callees, **kwargs):
+        if "fn_1" in code:
+            raise RuntimeError("429 rate limit")
+        if "fn_2" in code:
+            return "this is not valid C++ {{{"
+        return "int refined(int handle)\n{\n    return handle;\n}\n"
+
+    with patch("cpp_re_agent.contextual_improver.refine_function", side_effect=fake):
+        refined = pipeline.run_contextual(ws, status=lambda m: None, max_workers=4)
+
+    assert sorted(refined) == ["fn_0", "fn_3"]
+    assert (ws / "improved" / "fn_1.cpp").read_text() == original
+    assert "not valid C++" not in (ws / "improved" / "fn_2.cpp").read_text()
+
+
+def test_run_contextual_result_order_is_deterministic(tmp_path):
+    """Completion order varies with concurrency; the reported list must not."""
+    from cpp_re_agent import pipeline
+
+    with patch("cpp_re_agent.contextual_improver.refine_function",
+               return_value="int refined(int h)\n{\n    return h;\n}\n"):
+        first = pipeline.run_contextual(_workspace_with_improved(tmp_path / "a", 6),
+                                        status=lambda m: None, max_workers=6)
+        second = pipeline.run_contextual(_workspace_with_improved(tmp_path / "b", 6),
+                                         status=lambda m: None, max_workers=6)
+    assert first == second == sorted(first)
+
+
+# --- Shared streaming helpers ----------------------------------------------
+#
+# Every LLM call streams. A blocking `invoke` puts no bytes on the wire for the
+# whole generation, which trips idle-read timeouts on proxies in front of remote
+# endpoints — and a timed-out call that gets retried is genuinely slower.
+
+def test_stream_text_concatenates_chunks_and_reports_progress():
+    from cpp_re_agent.llm_factory import stream_text
+
+    def chunk(text):
+        c = MagicMock()
+        c.content = text
+        return c
+
+    llm = MagicMock()
+    llm.stream.return_value = iter([chunk("int "), chunk("f()"), chunk(" {}")])
+
+    seen = []
+    assert stream_text(llm, "prompt", on_chunk=seen.append) == "int f() {}"
+    # The callback sees the running text, so a caller can show partial output.
+    assert seen == ["int ", "int f()", "int f() {}"]
+    llm.invoke.assert_not_called()
+
+
+def test_stream_text_tolerates_chunks_without_content():
+    """Some clients emit metadata-only chunks; they must not break the join."""
+    from cpp_re_agent.llm_factory import stream_text
+
+    good, empty, bare = MagicMock(), MagicMock(), object()
+    good.content, empty.content = "code", None
+    llm = MagicMock()
+    llm.stream.return_value = iter([empty, good, bare])
+    assert stream_text(llm, "prompt") == "code"
+
+
+def test_stream_text_falls_back_to_invoke_without_streaming():
+    from cpp_re_agent.llm_factory import stream_text
+
+    llm = MagicMock()
+    llm.stream.side_effect = NotImplementedError("no streaming")
+    llm.invoke.return_value = MagicMock(content="blocking result")
+
+    seen = []
+    assert stream_text(llm, "prompt", on_chunk=seen.append) == "blocking result"
+    assert seen == ["blocking result"]
+
+
+def test_require_llm_names_the_missing_credential():
+    """
+    The regression: get_llm returning None produced
+    `AttributeError: 'NoneType' has no attribute 'stream'` several frames from
+    the real problem, which is an unset API key.
+    """
+    from cpp_re_agent.llm_factory import ImprovementError, require_llm
+
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=None):
+        with pytest.raises(ImprovementError, match="GEMINI_API_KEY"):
+            require_llm("gemini", "gemini-2.5-flash")
+        with pytest.raises(ImprovementError, match="LOCAL_LLM_URL"):
+            require_llm("local", "openai/gpt-oss-20b")
+
+
+def test_consolidate_definitions_checks_the_llm_and_streams():
+    """Header synthesis is the longest single call, so it must stream too."""
+    from cpp_re_agent import knowledge_graph
+    from cpp_re_agent.llm_factory import ImprovementError
+
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=None):
+        with pytest.raises(ImprovementError, match="could not be initialized"):
+            knowledge_graph.consolidate_definitions("struct A { int x; };")
+
+    def chunk(text):
+        c = MagicMock()
+        c.content = text
+        return c
+
+    llm = MagicMock()
+    llm.stream.return_value = iter([chunk("```cpp\nstruct A"), chunk(" { int x; };\n```")])
+    with patch("cpp_re_agent.llm_factory.get_llm", return_value=llm):
+        header = knowledge_graph.consolidate_definitions("struct A { int x; };")
+
+    # Chunks are joined and the markdown fences removed. The surrounding
+    # newlines survive because this stripper strips *then* replaces — see
+    # plan item T6, which unifies these on ai_improver.extract_code's regex.
+    assert header.strip() == "struct A { int x; };"
+    assert "```" not in header
+    llm.invoke.assert_not_called()

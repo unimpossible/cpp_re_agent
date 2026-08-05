@@ -1,4 +1,4 @@
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from . import scanner
 
@@ -89,6 +89,142 @@ def topological_order(graph: Dict[str, Set[str]], priority=None) -> List[str]:
                     order.append(node)
 
     return order
+
+
+def callers_of(graph: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+    """Reverse edges: function -> the functions that call it."""
+    callers: Dict[str, Set[str]] = {n: set() for n in graph}
+    for name, deps in graph.items():
+        for dep in deps:
+            if dep in callers:
+                callers[dep].add(name)
+    return callers
+
+
+def reachable_from(graph: Dict[str, Set[str]], start: str) -> Set[str]:
+    """Every function reachable from `start`, including itself."""
+    seen, frontier = {start}, [start]
+    while frontier:
+        node = frontier.pop()
+        for dep in graph.get(node, ()):
+            if dep not in seen:
+                seen.add(dep)
+                frontier.append(dep)
+    return seen
+
+
+def roots_of(graph: Dict[str, Set[str]]) -> List[str]:
+    """Functions nothing else calls."""
+    incoming = callers_of(graph)
+    return [n for n in graph if not incoming.get(n)]
+
+
+def primary_entry(graph: Dict[str, Set[str]]) -> Optional[str]:
+    """
+    Best guess at an executable's entry function.
+
+    In a stripped executable there is no `main` symbol to look for, but the
+    entry still behaves like one: nothing calls it, and it reaches most of the
+    program. Picking the uncalled function with the largest reachable set finds
+    it without needing any symbol at all.
+
+    Meaningless for a shared object, which has no single entry — use
+    `entry_points` instead, which handles both.
+    """
+    roots = roots_of(graph)
+    if not roots:
+        return None
+    return max(roots, key=lambda n: (len(reachable_from(graph, n)), n))
+
+
+def entry_points(graph: Dict[str, Set[str]],
+                 exported: Optional[Set[str]] = None,
+                 dominance: float = 0.5) -> List[str]:
+    """
+    Where the program is entered from the outside — the sources for depth.
+
+    An executable has one: `main`, reachable from nothing and reaching almost
+    everything. A shared object has many, one per exported function, and no
+    single root dominates. Measuring depth from only the biggest root would
+    then treat most of the library's own public API as unreachable, i.e. as
+    deep library noise, and skip exactly the functions a caller cares about.
+
+    `exported` (from the binary's dynamic symbol table, which survives
+    stripping) is used when given; otherwise every uncalled function is an
+    entry, which is the right default for a library.
+    """
+    roots = roots_of(graph)
+    if not roots:
+        return []
+
+    if exported:
+        named = [n for n in graph if n in exported]
+        if named:
+            return sorted(named)
+
+    best = max(roots, key=lambda n: (len(reachable_from(graph, n)), n))
+    if len(reachable_from(graph, best)) >= dominance * len(graph):
+        return [best]          # one root reaches the program: an executable
+    return sorted(roots)       # no dominant root: treat every root as an entry
+
+
+def call_depths(graph: Dict[str, Set[str]], start) -> Dict[str, int]:
+    """
+    Hops from `start` to each reachable function (sources themselves are 0).
+
+    `start` is one name or an iterable of them; several sources are a
+    multi-source BFS, which is what a shared object needs.
+
+    Depth separates a program's own code from the library it was linked
+    against far better than any naming or address heuristic once symbols are
+    gone: the user's functions sit near the entry points, while the statically
+    linked standard library is reached through them and piles up deeper.
+    """
+    starts = [start] if isinstance(start, str) else list(start)
+    depths = {s: 0 for s in starts}
+    frontier = list(depths)
+    while frontier:
+        nxt = []
+        for node in frontier:
+            for dep in graph.get(node, ()):
+                if dep not in depths:
+                    depths[dep] = depths[node] + 1
+                    nxt.append(dep)
+        frontier = nxt
+    return depths
+
+
+def levels_over_subset(graph: Dict[str, Set[str]], subset: Set[str],
+                       priority=None) -> List[List[str]]:
+    """
+    Dependency levels over `subset` only, with edges closed transitively.
+
+    Levels computed over the *whole* graph serialize far more than necessary
+    once most functions are filtered out: the survivors land in different
+    levels because skipped library functions occupy the ones between them, and
+    a level of one function means no parallelism at all. Real example — a
+    stripped shared object had 112 functions worth improving spread across 112
+    whole-graph levels, so every LLM call ran alone.
+
+    Two functions here are ordered only if one can actually reach the other,
+    so the leaves-first guarantee is preserved while independent work is free
+    to run concurrently.
+    """
+    members = {n for n in subset if n in graph}
+    if not members:
+        return []
+
+    condensed: Dict[str, Set[str]] = {}
+    # Insert in sorted order: `topological_levels` falls back to insertion
+    # order when two functions are unordered, and iterating a set here would
+    # make the batch order vary between runs on the same input.
+    for name in sorted(members):
+        # Callees inside the subset, including those reached only through
+        # functions that were filtered out.
+        reach = reachable_from(graph, name) - {name}
+        condensed[name] = reach & members
+
+    return topological_levels(condensed, priority)
 
 
 def topological_levels(graph: Dict[str, Set[str]], priority=None) -> List[List[str]]:

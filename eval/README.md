@@ -98,6 +98,41 @@ python -m eval.sweep_models --binary eval/bin/inventory-O2 --models qwen/qwen3-8
 
 With no `--models`, the local endpoint (`LOCAL_LLM_URL`) is asked what it serves.
 
+## Stripped-binary selection
+
+`stripped.py` measures a different thing from the other two halves: not how
+good the output is, but whether the pipeline **picks the right functions to
+improve at all** when the binary has no symbols.
+
+```bash
+python -m eval.stripped --case tier4_taskflow
+python -m eval.stripped --case tier4_taskflow --depths none,1,2,3,4 --json out.json
+```
+
+Ground truth comes from the fact that **stripping does not move code**: the
+same program built with and without symbols has its functions at identical
+addresses (100% correspondence on the corpus), so the unstripped decompilation
+says what each stripped `FUN_<addr>` really is. A function counts as the
+program's own when its unstripped name matches one defined in the corpus
+source — no hand-maintained list.
+
+It scores `pipeline.selected_functions`, the same call `batch_improve` plans
+with, so the numbers cannot drift from what the tool actually does. Current
+result on `tier4_taskflow-O0` (66 of 731 functions are the program's):
+
+| `--max-depth` | selected | precision | recall | f1 |
+|---|---|---|---|---|
+| off | 518 | 11.4% | 89.4% | 20.2% |
+| 1 | 29 | 72.4% | 31.8% | 44.2% |
+| **2** (default) | **72** | **55.6%** | **60.6%** | **58.0%** |
+| 3 | 132 | 35.6% | 71.2% | 47.5% |
+| 4 | 210 | 23.3% | 74.2% | 35.5% |
+
+Decompilations are cached under `experiments/stripped/`, since Ghidra takes
+minutes per binary. Build the inputs first with `./eval/build_binaries.sh`,
+which emits `<case>-{O0,O2}` and `<case>-{O0,O2}-stripped` for every program,
+plus `lib<case>-{O0,O2}.so` for multi-file ones.
+
 ## Prompt-optimization lab
 
 `run_experiment.py` drives the judged experiments; see

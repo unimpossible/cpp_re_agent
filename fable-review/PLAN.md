@@ -251,9 +251,16 @@ Ordered for execution. Each item is small enough to land and verify on its own.
       tests, all failing against the pre-fix tree; the stale
       `test_decompiler_handles_missing_output` (which still asserted the
       deleted `MOCK_FUNCTIONS` fallback) is replaced. *(§1.2)*
-- [ ] **T3. Null-check the LLM in `consolidate_definitions`**
-      (`knowledge_graph.py:135`) so a missing API key gives a clear error, not
-      `AttributeError`. *(§1.4 — the chunking half stays with `TODO.md` #5C.)*
+- [x] **T3. Null-check the LLM in `consolidate_definitions`.** *(done)* Solved
+      once for every call site rather than three times: new
+      `llm_factory.require_llm` raises `ImprovementError` naming the missing
+      credential (`GEMINI_API_KEY` / `LOCAL_LLM_URL`), and
+      `ai_improver`/`contextual_improver`/`knowledge_graph` all use it. Landed
+      with `llm_factory.stream_text`, which makes every LLM call stream — a
+      blocking `invoke` puts no bytes on the wire for the whole generation and
+      trips idle-read timeouts on proxies in front of remote endpoints. After
+      this, `llm.stream`/`llm.invoke` appear only in `llm_factory`.
+      *(§1.4 — the chunking half stays with `TODO.md` #5C.)*
 - [x] **T4. ~~Shared `config.py`~~ — dropped with the UI.** *(moot)* The three
       duplicated `load_config` copies and the broken `..` path lived only in the
       Streamlit pages, which are deleted; `config.json` is gone too. The CLI is

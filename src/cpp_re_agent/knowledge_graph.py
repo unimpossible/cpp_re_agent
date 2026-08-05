@@ -2,7 +2,7 @@ import os
 import uuid
 from typing import List, Dict
 from .scanner import CppType
-from .llm_factory import get_llm
+from .llm_factory import ImprovementError, require_llm, stream_text
 
 # Persistent local storage for the ChromaDB vector store.
 DB_DIR = os.path.join(os.getcwd(), "chroma_db")
@@ -131,12 +131,21 @@ def consolidate_definitions(all_definitions: str, provider="local",
     Merge a block of (possibly duplicate/partial) type definitions into a single
     project.h via the LLM. `base_prompt` overrides the default instruction (this
     is the knob the header-synthesis experiment optimizes).
+
+    Streams (via `llm_factory.stream_text`) rather than blocking on a single
+    `invoke`: this is the largest prompt the pipeline sends, and a non-streaming
+    call sits idle — no bytes on the wire — for the whole generation, which
+    trips idle-read timeouts on proxies and gateways in front of remote
+    endpoints. Streaming keeps bytes flowing so those timeouts don't fire.
     """
-    llm = get_llm(provider, model_name)
+    llm = require_llm(provider, model_name)
     instruction = base_prompt if base_prompt is not None else DEFAULT_CONSOLIDATE_PROMPT
     prompt = f"{instruction}\n\nDefinitions:\n{all_definitions}"
-    response = llm.invoke(prompt)
-    return response.content.strip().replace("```cpp", "").replace("```", "")
+    try:
+        content = stream_text(llm, prompt)
+    except Exception as e:
+        raise ImprovementError(f"Header synthesis failed: {e}") from e
+    return content.strip().replace("```cpp", "").replace("```", "")
 
 
 def consolidate_types(provider="local", model_name="openai/gpt-oss-20b",

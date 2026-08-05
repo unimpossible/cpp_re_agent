@@ -53,6 +53,56 @@ class ImprovementError(Exception):
     """
 
 
+def require_llm(provider: str = "local", model_name: str = "openai/gpt-oss-20b"):
+    """
+    `get_llm`, but raising instead of returning None.
+
+    `get_llm` returns None when credentials are missing, and every call site
+    then has to remember to check. Forgetting produces
+    `AttributeError: 'NoneType' object has no attribute 'stream'` several
+    frames away from the actual problem, which is a missing API key.
+    """
+    llm = get_llm(provider, model_name)
+    if llm is None:
+        key = "GEMINI_API_KEY" if provider == "gemini" else "LOCAL_LLM_URL"
+        raise ImprovementError(
+            f"LLM client could not be initialized for provider={provider!r} "
+            f"(check {key} in your environment or .env)."
+        )
+    return llm
+
+
+def stream_text(llm, prompt, on_chunk=None) -> str:
+    """
+    Run one completion, streaming, and return the full text.
+
+    Streaming rather than a single blocking `invoke` for three reasons: a long
+    generation otherwise puts no bytes on the wire for its whole duration,
+    which trips idle-read timeouts on proxies and gateways in front of remote
+    endpoints (and a timed-out call that gets retried is genuinely slower); it
+    gives time-to-first-token feedback instead of a silent wait; and partial
+    output survives a mid-generation failure.
+
+    `prompt` is anything the client accepts — a string or a message list.
+    Falls back to a blocking call for clients that cannot stream.
+    """
+    text = ""
+    try:
+        for chunk in llm.stream(prompt):
+            piece = getattr(chunk, "content", "") or ""
+            if piece:
+                text += piece
+                if on_chunk:
+                    on_chunk(text)
+        return text
+    except (AttributeError, NotImplementedError):
+        # Client without streaming support: one blocking call.
+        text = llm.invoke(prompt).content
+        if on_chunk:
+            on_chunk(text)
+        return text
+
+
 def get_llm(provider="local", model_name="openai/gpt-oss-20b"):
     """
     Returns a LangChain LLM instance for the specified provider.
